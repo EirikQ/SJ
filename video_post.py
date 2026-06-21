@@ -237,7 +237,7 @@ def overlay_caption(img_bytes: bytes, caption: str, model: str,
 # 图片序列 → MP4 + BGM
 # ══════════════════════════════════════════════════════════════
 def images_to_mp4(frames_bytes: list, bgm_wav: bytes,
-                  fps: int = 24, sec_per_frame: int = 4) -> bytes:
+                  fps: int = 24, sec_per_frame: int = 8) -> bytes:
     with tempfile.TemporaryDirectory() as tmpdir:
         video_path = os.path.join(tmpdir, "video.mp4")
         audio_path = os.path.join(tmpdir, "bgm.wav")
@@ -495,8 +495,8 @@ async def generate_and_publish_video(
         styled_frames = [overlay_caption(fb, caption, model, i, len(raw_frames))
                          for i, fb in enumerate(raw_frames)]
         style    = BGM_STYLE.get(model, "modern")
-        bgm      = generate_bgm_wav(style, len(styled_frames)*4 + 2.0)
-        mp4      = images_to_mp4(styled_frames, bgm, fps=24, sec_per_frame=4)
+        bgm      = generate_bgm_wav(style, len(styled_frames)*8 + 2.0)
+        mp4      = images_to_mp4(styled_frames, bgm, fps=24, sec_per_frame=8)
         fb_resp  = publish_video_fb(mp4, caption)
 
         result = {

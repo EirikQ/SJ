@@ -268,6 +268,27 @@ def run_scheduled_post(model, market, language, post_type, whatsapp, post_mode="
             fb_resp = post_to_facebook(content)
         log_post(model, language, market, post_type, content, fb_resp)
         print(f"[定时任务] ✅ 发布成功: {fb_resp.get('id', '失败')}")
+        # 自动登记到实验系统 content_log
+        fb_post_id = fb_resp.get("id")
+        if fb_post_id:
+            try:
+                from experiment import get_conn
+                type_map = {
+                    "product_intro": "参数", "price_value": "价格",
+                    "lifestyle": "情绪", "feature_spotlight": "案例",
+                    "new_arrival": "信任",
+                }
+                content_type = type_map.get(post_type, post_type)
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO content_log
+                           (platform, content_type, country, car_model, fb_post_id, ad_spend)
+                           VALUES (%s,%s,%s,%s,%s,%s)""",
+                        ("facebook", content_type, market, model, fb_post_id, 0))
+                    conn.commit()
+                print(f"[定时任务] 📊 content_log 已登记: {content_type} / {model}")
+            except Exception as exp_err:
+                print(f"[定时任务] content_log 登记失败(不影响发帖): {exp_err}")
     except Exception as e:
         print(f"[定时任务] ❌ 错误: {e}")
 
@@ -541,24 +562,73 @@ def bulk_generate(data: BulkPostRequest):
     results = []
     for item in data.items:
         try:
-            prompt  = build_post_prompt(
-                item.get("model","T5 EVO"), item.get("market","Senegal"),
-                item.get("language","French"), item.get("post_type","product_intro"),
-                data.whatsapp)
+            model     = item.get("model", "T5 EVO")
+            market    = item.get("market", "Senegal")
+            language  = item.get("language", "French")
+            post_type = item.get("post_type", "product_intro")
+            post_mode = item.get("post_mode", "text")
+
+            prompt  = build_post_prompt(model, market, language, post_type, data.whatsapp)
             content = call_deepseek([
                 {"role":"system","content":"你是非洲市场汽车社交媒体营销专家。"},
                 {"role":"user","content":prompt},
             ])
-            fb_resp = None
+
+            fb_resp   = None
+            fb_post_id = None
+
             if data.auto_publish:
-                fb_resp = post_to_facebook(content)
-                log_post(item.get("model"), item.get("language"),
-                         item.get("market"), item.get("post_type"),
-                         content, fb_resp)
+                # 根据 post_mode 选择发帖方式
+                if post_mode == "image":
+                    try:
+                        from image_post import generate_image_sf, overlay_text, publish_photo_to_facebook
+                        img_bytes = generate_image_sf(model)
+                        img_bytes = overlay_text(img_bytes, content, model)
+                        fb_resp   = publish_photo_to_facebook(img_bytes, content)
+                    except Exception as img_err:
+                        print(f"[bulk] 图文失败，降级纯文字: {img_err}")
+                        fb_resp = post_to_facebook(content)
+                elif post_mode == "video":
+                    try:
+                        from video_post import generate_sf_image, images_to_mp4, generate_bgm_wav, publish_mp4_to_facebook
+                        frames    = [generate_sf_image(model) for _ in range(3)]
+                        bgm       = generate_bgm_wav("upbeat", duration_sec=len(frames)*8+2)
+                        mp4_bytes = images_to_mp4(frames, bgm)
+                        fb_resp   = publish_mp4_to_facebook(mp4_bytes, content)
+                    except Exception as vid_err:
+                        print(f"[bulk] 视频失败，降级纯文字: {vid_err}")
+                        fb_resp = post_to_facebook(content)
+                else:
+                    fb_resp = post_to_facebook(content)
+
+                log_post(model, language, market, post_type, content, fb_resp or {})
+                fb_post_id = (fb_resp or {}).get("id")
+
+                # 自动登记到实验系统 content_log
+                if fb_post_id:
+                    try:
+                        from experiment import get_conn
+                        # 将 post_type 映射为 content_type 实验分类
+                        type_map = {
+                            "product_intro": "参数", "price_value": "价格",
+                            "lifestyle": "情绪", "feature_spotlight": "案例",
+                            "new_arrival": "信任",
+                        }
+                        content_type = type_map.get(post_type, post_type)
+                        with get_conn() as conn, conn.cursor() as cur:
+                            cur.execute(
+                                """INSERT INTO content_log
+                                   (platform, content_type, country, car_model, fb_post_id, ad_spend)
+                                   VALUES (%s,%s,%s,%s,%s,%s)""",
+                                ("facebook", content_type, market, model, fb_post_id, 0))
+                            conn.commit()
+                    except Exception as exp_err:
+                        print(f"[bulk] content_log 登记失败(不影响发帖): {exp_err}")
+
             results.append({
-                "success": True, "model": item.get("model"),
+                "success": True, "model": model, "post_mode": post_mode,
                 "content": content, "published": data.auto_publish,
-                "fb_post_id": fb_resp.get("id") if fb_resp else None,
+                "fb_post_id": fb_post_id,
             })
         except Exception as e:
             results.append({"success":False,"model":item.get("model"),"error":str(e)})
