@@ -789,3 +789,15 @@ from image_library import router as library_router
 app.include_router(image_router)
 app.include_router(video_router)
 app.include_router(library_router)
+# ── MWM 实验模块 ──────────────────────────────────────────
+from experiment import router as experiment_router, init_db as init_experiment_db
+from scheduler import start_scheduler
+app.include_router(experiment_router)
+
+@app.on_event("startup")
+def _mwm_startup():
+    try:
+        init_experiment_db()
+        start_scheduler()
+    except Exception as e:
+        print("MWM startup failed:", e)
