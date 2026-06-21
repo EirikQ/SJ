@@ -11,3 +11,5 @@ imageio==2.35.1
 imageio-ffmpeg==0.5.1
 python-multipart==0.0.9
 psutil==6.0.0
+
+psycopg2-binary==2.9.9
