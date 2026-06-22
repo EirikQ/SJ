@@ -271,6 +271,17 @@ def images_to_mp4(frames_bytes: list, bgm_wav: bytes,
 # 硅基流动 + 可灵
 # ══════════════════════════════════════════════════════════════
 def generate_sf_image(model: str, prompt_idx: int = 0) -> bytes:
+    # 优先使用 Cloudinary 图片库
+    try:
+        from image_library import get_image_bytes, count_local_images
+        if count_local_images(model) > 0:
+            print(f"[video_post] {model}: 使用 Cloudinary 图片库")
+            return get_image_bytes(model, prompt_idx)
+    except Exception as e:
+        print(f"[video_post] 图片库读取失败，降级AI生成: {e}")
+
+    # 降级：硅基流动 AI 生成
+    print(f"[video_post] {model}: 降级到 AI 生成图片")
     prompts = VEHICLE_PROMPTS.get(model, VEHICLE_PROMPTS["T5 EVO"])
     prompt  = prompts[prompt_idx % len(prompts)]
     resp = requests.post(
@@ -287,7 +298,6 @@ def generate_sf_image(model: str, prompt_idx: int = 0) -> bytes:
         url = data["images"][0].get("url", "")
         if url:
             raw = requests.get(url, timeout=30).content
-            # 统一resize到1088x1088（能被16整除，避免ffmpeg警告）
             img = Image.open(io.BytesIO(raw)).convert("RGB").resize((1088, 1088))
             out = io.BytesIO()
             img.save(out, format="JPEG", quality=92)
