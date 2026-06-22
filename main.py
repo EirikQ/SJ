@@ -364,10 +364,11 @@ def run_scheduled_post(model, market, language, post_type, whatsapp, post_mode="
             fb_resp   = publish_photo_to_facebook(img_bytes, content)
         elif post_mode == "video":
             # 视频模式：调用视频生成接口
-            from video_post import generate_sf_image, make_slideshow_gif, publish_gif_to_facebook
+            from video_post import generate_sf_image, images_to_mp4, generate_bgm_wav, publish_video_fb
             frames    = [generate_sf_image(model) for _ in range(3)]
-            gif_bytes = make_slideshow_gif(frames, content)
-            fb_resp   = publish_gif_to_facebook(gif_bytes, content)
+            bgm       = generate_bgm_wav("upbeat", duration_sec=len(frames)*8+2)
+            mp4_bytes = images_to_mp4(frames, bgm)
+            fb_resp   = publish_video_fb(mp4_bytes, content)
         else:
             # 纯文字
             fb_resp = post_to_facebook(content)
@@ -736,11 +737,11 @@ def bulk_generate(data: BulkPostRequest):
                         fb_resp = post_to_facebook(content)
                 elif post_mode == "video":
                     try:
-                        from video_post import generate_sf_image, images_to_mp4, generate_bgm_wav, publish_mp4_to_facebook
+                        from video_post import generate_sf_image, images_to_mp4, generate_bgm_wav, publish_video_fb
                         frames    = [generate_sf_image(model) for _ in range(3)]
                         bgm       = generate_bgm_wav("upbeat", duration_sec=len(frames)*8+2)
                         mp4_bytes = images_to_mp4(frames, bgm)
-                        fb_resp   = publish_mp4_to_facebook(mp4_bytes, content)
+                        fb_resp   = publish_video_fb(mp4_bytes, content)
                     except Exception as vid_err:
                         print(f"[bulk] 视频失败，降级纯文字: {vid_err}")
                         fb_resp = post_to_facebook(content)
