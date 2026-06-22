@@ -21,7 +21,7 @@ import psycopg2
 import psycopg2.extras
 
 # 复用 experiment.py 里的连接、洞察抓取、分组统计
-from experiment import get_conn, _fetch_fb_insight, _group_stats
+from experiment import get_conn, _fetch_fb_insight, _attribution_stats
 
 # ---------------------------------------------------------------------
 # 预设要自动验证的假设清单。
