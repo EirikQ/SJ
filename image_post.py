@@ -59,8 +59,19 @@ class ImagePostRequest(BaseModel):
     market:   str = "Senegal"
     language: str = "French"
 
-# ── 1. 调用硅基流动生成图片 ──────────────────────────────────
+# ── 1. 获取图片（优先 Cloudinary 图片库，降级 AI 生成）────────
 def generate_image_sf(model: str) -> bytes:
+    # 优先使用 Cloudinary 图片库
+    try:
+        from image_library import get_image_bytes, count_local_images
+        if count_local_images(model) > 0:
+            print(f"[image_post] {model}: 使用 Cloudinary 图片库")
+            return get_image_bytes(model)
+    except Exception as e:
+        print(f"[image_post] 图片库读取失败，降级AI生成: {e}")
+
+    # 降级：硅基流动 AI 生成
+    print(f"[image_post] {model}: 降级到 AI 生成图片")
     vis = VEHICLE_VISUALS.get(model, VEHICLE_VISUALS["T5 EVO"])
     resp = requests.post(
         "https://api.siliconflow.cn/v1/images/generations",
@@ -68,19 +79,18 @@ def generate_image_sf(model: str) -> bytes:
             "Authorization": f"Bearer {SILICONFLOW_API_KEY}",
             "Content-Type": "application/json",
         },
-       json={
-    "model":               "Kwai-Kolors/Kolors",
-    "prompt":              vis["prompt"],
-    "negative_prompt":     vis["neg"],
-    "image_size":          "1024x1024",
-    "num_inference_steps": 20,
-    "guidance_scale":      7.5,
-    "batch_size":          1,
-},
+        json={
+            "model":               "Kwai-Kolors/Kolors",
+            "prompt":              vis["prompt"],
+            "negative_prompt":     vis["neg"],
+            "image_size":          "1024x1024",
+            "num_inference_steps": 20,
+            "guidance_scale":      7.5,
+            "batch_size":          1,
+        },
         timeout=120,
     )
     data = resp.json()
-    # 返回 base64 或 url
     if "images" in data and data["images"]:
         img_data = data["images"][0]
         if "url" in img_data:
