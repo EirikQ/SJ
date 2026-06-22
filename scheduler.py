@@ -30,25 +30,32 @@ from experiment import get_conn, _fetch_fb_insight, _group_stats
 # ---------------------------------------------------------------------
 PRESET_HYPOTHESES = [
     {
-        "hypothesis": "案例内容比参数内容更容易获得询盘",
+        "hypothesis": "案例内容比参数内容带来更高利润",
         "variable": "content_type",
         "test_group": "案例",
         "control_group": "参数",
-        "metric": "inquiry_rate",
+        "metric": "profit_per_content",
     },
     {
-        "hypothesis": "情绪内容比参数内容点击率更高",
+        "hypothesis": "情绪内容比参数内容带来更高利润",
         "variable": "content_type",
         "test_group": "情绪",
         "control_group": "参数",
-        "metric": "ctr",
+        "metric": "profit_per_content",
     },
     {
-        "hypothesis": "价格内容比信任内容更容易成交",
+        "hypothesis": "价格内容比信任内容带来更高利润",
         "variable": "content_type",
         "test_group": "价格",
         "control_group": "信任",
-        "metric": "deal_rate",
+        "metric": "profit_per_content",
+    },
+    {
+        "hypothesis": "案例内容的高质量询盘率高于参数内容",
+        "variable": "content_type",
+        "test_group": "案例",
+        "control_group": "参数",
+        "metric": "qualified_rate",
     },
 ]
 
@@ -145,23 +152,38 @@ def _evaluate(test, ctrl, metric):
 
 
 def auto_run_experiments():
-    """对 PRESET_HYPOTHESES 逐条跑实验，结果写 experiment_log。
-    每次跑都新增一行（保留历史），可在仪表盘看同一假设随时间的演化。"""
+    """对 PRESET_HYPOTHESES 逐条跑实验，以利润为目标变量，结果写 experiment_log。"""
     started = datetime.utcnow().isoformat()
     ran = 0
+    from experiment import _attribution_stats
     with get_conn() as conn, conn.cursor() as cur:
         for h in PRESET_HYPOTHESES:
             try:
-                test = _group_stats(cur, h["variable"], h["test_group"], h["metric"], WINDOW_DAYS)
-                ctrl = _group_stats(cur, h["variable"], h["control_group"], h["metric"], WINDOW_DAYS)
-                ev = _evaluate(test, ctrl, h["metric"])
+                test = _attribution_stats(cur, h["test_group"], WINDOW_DAYS)
+                ctrl = _attribution_stats(cur, h["control_group"], WINDOW_DAYS)
+                metric = h["metric"]
+                t_val  = test.get(metric, 0) or 0
+                c_val  = ctrl.get(metric, 0) or 0
+                lift   = round(t_val - c_val, 4)
+                rel    = round((t_val/c_val - 1), 4) if c_val else None
+                min_n  = min(test["leads"], ctrl["leads"])
+                sf     = min(min_n / 5.0, 1.0)
+                ef     = min(abs(rel or 0), 1.0)
+                conf   = round(sf * (0.4 + 0.6 * ef), 3)
+                if min_n < 2 or conf < 0.25: conclusion = "数据不足"
+                elif lift > 0 and conf >= 0.5: conclusion = "成立"
+                elif lift <= 0 and conf >= 0.5: conclusion = "推翻"
+                else: conclusion = "不显著"
+                result = {"test": test, "control": ctrl,
+                          "lift_abs": lift, "lift_rel": rel,
+                          "metric": metric}
                 cur.execute("""
                     INSERT INTO experiment_log
                       (hypothesis, variable, test_group, control_group, metric,
                        result_metrics, conclusion, confidence_score, status)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'done')
                 """, (h["hypothesis"], h["variable"], h["test_group"], h["control_group"],
-                      h["metric"], json.dumps(ev["result"]), ev["conclusion"], ev["confidence"]))
+                      metric, json.dumps(result, default=str), conclusion, conf))
                 ran += 1
             except Exception as e:
                 print(f"[auto_run] 假设 '{h['hypothesis']}' 失败: {e}")
@@ -202,9 +224,22 @@ def start_scheduler():
     # 每天跑实验（晚于刷新，确保用的是最新数据）
     _scheduler.add_job(auto_run_experiments, CronTrigger(hour=2, minute=30),
                        id="auto_run", replace_existing=True)
+    # 每周一 03:00 UTC 提取规律（北京时间周一 11:00）
+    _scheduler.add_job(_weekly_pattern_extraction, CronTrigger(day_of_week="mon", hour=3, minute=0),
+                       id="pattern_extract", replace_existing=True)
     _scheduler.start()
-    print("[scheduler] 已启动：02:00 刷新漏斗，02:30 自动跑实验 (UTC)")
+    print("[scheduler] 已启动：02:00刷漏斗/02:30跑实验/周一03:00提取规律 (UTC)")
     return _scheduler
+
+
+def _weekly_pattern_extraction():
+    """每周自动从归因链路提取规律。"""
+    try:
+        from experiment import _extract_patterns
+        result = _extract_patterns()
+        print(f"[pattern_extract] 完成: {result}")
+    except Exception as e:
+        print(f"[pattern_extract] 失败: {e}")
 
 
 # ---------------------------------------------------------------------
