@@ -1,28 +1,23 @@
-# image_library.py
-# D:\AI\ChinaAutoAI\backend\image_library.py
-#
-# 图片来源优先级：
-# 1. 本地上传图片（car_images/<MODEL>/）
-# 2. Unsplash API（免费，无版权）
-# 3. 硅基流动AI生成（最后备用）
+# image_library.py — Cloudinary 云存储版
+# 图片永久存储在 Cloudinary，Railway 重新部署不丢失
+# 图片来源优先级：Cloudinary云库 → Unsplash → 报错
 
-import os, io, random, base64, requests, shutil
+import os, io, random, base64, requests
 from fastapi import APIRouter, UploadFile, File, Form
-from fastapi.responses import JSONResponse
 from PIL import Image
 from dotenv import load_dotenv
 
 load_dotenv()
 router = APIRouter()
 
-# ── 配置 ────────────────────────────────────────────────────
-UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
-SILICONFLOW_API_KEY = os.getenv("SILICONFLOW_API_KEY", "")
+# ── 配置 ─────────────────────────────────────────────────────
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+CLOUDINARY_API_KEY    = os.getenv("CLOUDINARY_API_KEY", "")
+CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET", "")
+UNSPLASH_ACCESS_KEY   = os.getenv("UNSPLASH_ACCESS_KEY", "")
 
-# 本地图片库根目录（相对于 main.py 所在目录）
-CAR_IMAGES_DIR = os.path.join(os.path.dirname(__file__), "car_images")
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
-# Unsplash 搜索关键词（按车型）
 UNSPLASH_QUERIES = {
     "T5 EVO":  ["silver SUV car road", "compact SUV city", "modern SUV driving"],
     "FRIDAY":  ["electric car city", "electric MPV", "EV family car"],
@@ -31,287 +26,289 @@ UNSPLASH_QUERIES = {
     "P8":      ["flagship SUV mountain", "luxury SUV dark", "premium SUV fog"],
 }
 
-# 支持的图片格式
-ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+# Cloudinary 文件夹前缀
+FOLDER = "forthing_cars"
+
 
 # ══════════════════════════════════════════════════════════════
-# 本地图片库操作
+# Cloudinary 工具函数
 # ══════════════════════════════════════════════════════════════
-def get_model_dir(model: str) -> str:
-    """获取车型图片目录，不存在则创建"""
-    model_key = model.replace(" ", "").upper().replace("EVO", "EVO")
-    # 特殊映射
-    mapping = {
-        "T5EVO": "T5EVO",
-        "FRIDAY": "FRIDAY",
-        "V9": "V9",
-        "P6": "P6",
-        "P8": "P8",
-    }
-    folder = mapping.get(model_key, model_key)
-    path = os.path.join(CAR_IMAGES_DIR, folder)
-    os.makedirs(path, exist_ok=True)
-    return path
+def _cloudinary_configured() -> bool:
+    return bool(CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET)
 
-def get_local_images(model: str) -> list:
-    """获取本地图片路径列表"""
-    model_dir = get_model_dir(model)
-    images = []
-    for f in sorted(os.listdir(model_dir)):
-        ext = os.path.splitext(f)[1].lower()
-        if ext in ALLOWED_EXTENSIONS:
-            images.append(os.path.join(model_dir, f))
-    return images
 
-def read_image_bytes(path: str, size: tuple = (1088, 1088)) -> bytes:
-    """读取并resize图片"""
-    img = Image.open(path).convert("RGB").resize(size)
+def _model_folder(model: str) -> str:
+    """把车型名转为 Cloudinary 文件夹路径"""
+    key = model.replace(" ", "_").upper()
+    return f"{FOLDER}/{key}"
+
+
+def _upload_to_cloudinary(image_bytes: bytes, model: str, filename: str) -> dict:
+    """上传图片到 Cloudinary，返回 {url, public_id}"""
+    import cloudinary
+    import cloudinary.uploader
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+    )
+    folder = _model_folder(model)
+    # public_id 去掉扩展名
+    pub_id = f"{folder}/{os.path.splitext(filename)[0]}"
+    result = cloudinary.uploader.upload(
+        image_bytes,
+        public_id=pub_id,
+        overwrite=False,
+        resource_type="image",
+        transformation=[{"width": 1088, "height": 1088, "crop": "fill", "quality": "auto"}],
+    )
+    return {"url": result["secure_url"], "public_id": result["public_id"]}
+
+
+def _list_cloudinary_images(model: str) -> list:
+    """列出某车型在 Cloudinary 的所有图片 URL"""
+    if not _cloudinary_configured():
+        return []
+    try:
+        import cloudinary
+        import cloudinary.api
+        cloudinary.config(
+            cloud_name=CLOUDINARY_CLOUD_NAME,
+            api_key=CLOUDINARY_API_KEY,
+            api_secret=CLOUDINARY_API_SECRET,
+        )
+        folder = _model_folder(model)
+        result = cloudinary.api.resources(
+            type="upload",
+            prefix=folder,
+            max_results=50,
+        )
+        return [r["secure_url"] for r in result.get("resources", [])]
+    except Exception as e:
+        print(f"[Cloudinary] 列出图片失败 {model}: {e}")
+        return []
+
+
+def _delete_cloudinary_folder(model: str) -> int:
+    """清空某车型的 Cloudinary 图片"""
+    if not _cloudinary_configured():
+        return 0
+    try:
+        import cloudinary
+        import cloudinary.api
+        cloudinary.config(
+            cloud_name=CLOUDINARY_CLOUD_NAME,
+            api_key=CLOUDINARY_API_KEY,
+            api_secret=CLOUDINARY_API_SECRET,
+        )
+        folder = _model_folder(model)
+        result = cloudinary.api.resources(type="upload", prefix=folder, max_results=100)
+        ids = [r["public_id"] for r in result.get("resources", [])]
+        if ids:
+            cloudinary.api.delete_resources(ids)
+        return len(ids)
+    except Exception as e:
+        print(f"[Cloudinary] 清空失败 {model}: {e}")
+        return 0
+
+
+def _url_to_bytes(url: str, size: tuple = (1088, 1088)) -> bytes:
+    """从 URL 下载图片并 resize"""
+    resp = requests.get(url, timeout=30)
+    img = Image.open(io.BytesIO(resp.content)).convert("RGB").resize(size)
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=92)
     return out.getvalue()
 
+
+# ══════════════════════════════════════════════════════════════
+# 智能图片获取（优先 Cloudinary → Unsplash）
+# ══════════════════════════════════════════════════════════════
+def get_image_bytes(model: str, index: int = None) -> bytes:
+    """获取单张图片"""
+    urls = _list_cloudinary_images(model)
+    if urls:
+        url = random.choice(urls) if index is None else urls[index % len(urls)]
+        return _url_to_bytes(url)
+    if UNSPLASH_ACCESS_KEY:
+        return _get_unsplash_image(model, index or 0)
+    raise Exception(f"无可用图片：{model} 云库为空且未配置 Unsplash Key")
+
+
+def get_image_sequence(model: str, count: int = 3) -> list:
+    """获取多张图片（用于视频帧）"""
+    urls = _list_cloudinary_images(model)
+    if urls:
+        print(f"[图片库] {model}: Cloudinary {len(urls)}张")
+        selected = random.sample(urls, min(count, len(urls)))
+        if len(selected) < count:
+            selected = (selected * (count // len(selected) + 1))[:count]
+        results = []
+        for url in selected:
+            try:
+                results.append(_url_to_bytes(url))
+            except Exception as e:
+                print(f"[图片库] 下载失败 {url}: {e}")
+        if results:
+            return results
+
+    if UNSPLASH_ACCESS_KEY:
+        print(f"[图片库] {model}: 使用 Unsplash")
+        return _get_unsplash_sequence(model, count)
+
+    raise Exception(f"{model} 暂无图片：请上传图片到图片库")
+
+
+# 兼容旧调用
 def get_local_image_bytes(model: str, index: int = None) -> bytes:
-    """
-    从本地库获取图片bytes
-    index=None时随机选取
-    """
-    images = get_local_images(model)
-    if not images:
-        raise FileNotFoundError(f"本地图片库为空: {model}")
-    if index is None:
-        path = random.choice(images)
-    else:
-        path = images[index % len(images)]
-    return read_image_bytes(path)
+    return get_image_bytes(model, index)
 
 def get_local_image_sequence(model: str, count: int = 3) -> list:
-    """
-    获取一组本地图片（用于视频帧）
-    尽量选不重复的图，数量不足时循环使用
-    """
-    images = get_local_images(model)
-    if not images:
-        raise FileNotFoundError(f"本地图片库为空: {model}")
-
-    if len(images) >= count:
-        selected = random.sample(images, count)
-    else:
-        selected = (images * (count // len(images) + 1))[:count]
-        random.shuffle(selected)
-
-    results = []
-    for p in selected:
-        try:
-            results.append(read_image_bytes(p))
-        except Exception as e:
-            print(f"[图片库] 读取失败 {p}: {e}")
-    if not results:
-        raise Exception(f"图片读取全部失败: {model}")
-    return results
+    return get_image_sequence(model, count)
 
 def count_local_images(model: str) -> int:
-    return len(get_local_images(model))
+    return len(_list_cloudinary_images(model))
+
 
 # ══════════════════════════════════════════════════════════════
-# Unsplash API
+# Unsplash 备用
 # ══════════════════════════════════════════════════════════════
-def get_unsplash_image(model: str, index: int = 0) -> bytes:
-    """
-    从Unsplash获取高质量免版权图片
-    需要在 .env 里设置 UNSPLASH_ACCESS_KEY
-    """
+def _get_unsplash_image(model: str, index: int = 0) -> bytes:
     if not UNSPLASH_ACCESS_KEY:
-        raise Exception("未配置 UNSPLASH_ACCESS_KEY，请在系统设置中填写")
-
+        raise Exception("未配置 UNSPLASH_ACCESS_KEY")
     queries = UNSPLASH_QUERIES.get(model, ["luxury car road"])
-    query   = queries[index % len(queries)]
-
-    resp = requests.get(
-        "https://api.unsplash.com/photos/random",
-        params={
-            "query":       query,
-            "orientation": "squarish",
-            "content_filter": "high",
-        },
-        headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"},
-        timeout=15,
-    )
-
+    query = queries[index % len(queries)]
+    resp = requests.get("https://api.unsplash.com/photos/random",
+        params={"query": query, "orientation": "squarish", "content_filter": "high"},
+        headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}, timeout=15)
     if resp.status_code != 200:
-        raise Exception(f"Unsplash API错误: {resp.status_code} {resp.text[:100]}")
+        raise Exception(f"Unsplash错误: {resp.status_code}")
+    img_url = resp.json()["urls"]["regular"]
+    return _url_to_bytes(img_url)
 
-    data     = resp.json()
-    img_url  = data["urls"]["regular"]  # 1080px宽
-    img_resp = requests.get(img_url, timeout=30)
-    img      = Image.open(io.BytesIO(img_resp.content)).convert("RGB").resize((1088, 1088))
-    out      = io.BytesIO()
-    img.save(out, format="JPEG", quality=92)
-    return out.getvalue()
 
-def get_unsplash_sequence(model: str, count: int = 3) -> list:
-    """获取多张Unsplash图片"""
+def _get_unsplash_sequence(model: str, count: int = 3) -> list:
     results = []
     for i in range(count):
         try:
-            results.append(get_unsplash_image(model, index=i))
+            results.append(_get_unsplash_image(model, index=i))
         except Exception as e:
             print(f"[Unsplash] 第{i+1}张失败: {e}")
     return results
 
-# ══════════════════════════════════════════════════════════════
-# 智能图片获取（优先级：本地 → Unsplash → 报错）
-# ══════════════════════════════════════════════════════════════
-def get_image_bytes(model: str, index: int = None) -> bytes:
-    """单张图片，自动选择来源"""
-    # 1. 优先本地
-    local = get_local_images(model)
-    if local:
-        return get_local_image_bytes(model, index)
-
-    # 2. Unsplash
-    if UNSPLASH_ACCESS_KEY:
-        return get_unsplash_image(model, index or 0)
-
-    raise Exception(f"无可用图片：{model} 本地库为空且未配置Unsplash Key")
-
-def get_image_sequence(model: str, count: int = 3) -> list:
-    """
-    获取多张图片序列（用于视频帧）
-    优先级：本地 → Unsplash
-    """
-    # 1. 本地图片
-    local_count = count_local_images(model)
-    if local_count > 0:
-        print(f"[图片库] {model}: 使用本地图片 ({local_count}张可用)")
-        return get_local_image_sequence(model, count)
-
-    # 2. Unsplash
-    if UNSPLASH_ACCESS_KEY:
-        print(f"[图片库] {model}: 本地无图，使用Unsplash")
-        imgs = get_unsplash_sequence(model, count)
-        if imgs:
-            return imgs
-
-    raise Exception(
-        f"{model} 暂无图片：请上传图片到图片库，或在系统设置中配置 Unsplash API Key"
-    )
 
 # ══════════════════════════════════════════════════════════════
 # API 接口
 # ══════════════════════════════════════════════════════════════
-
 @router.get("/library/status")
 def library_status():
-    """查看各车型图片库状态"""
     models = ["T5 EVO", "FRIDAY", "V9", "P6", "P8"]
     result = {}
     for m in models:
-        local = get_local_images(m)
-        result[m] = {
-            "local_count":    len(local),
-            "unsplash_ready": bool(UNSPLASH_ACCESS_KEY),
-            "source":         "本地图片" if local else ("Unsplash" if UNSPLASH_ACCESS_KEY else "❌ 无图片源"),
-            "thumbnails":     [],
-        }
-        # 返回前3张缩略图base64
-        for p in local[:3]:
+        urls = _list_cloudinary_images(m)
+        count = len(urls)
+        source = "Cloudinary ☁️" if count > 0 else ("Unsplash" if UNSPLASH_ACCESS_KEY else "❌ 无图片源")
+        thumbnails = []
+        for url in urls[:3]:
             try:
-                img  = Image.open(p).convert("RGB").resize((120, 120))
-                buf  = io.BytesIO()
+                resp = requests.get(url, timeout=10)
+                img = Image.open(io.BytesIO(resp.content)).convert("RGB").resize((120, 120))
+                buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=70)
-                result[m]["thumbnails"].append(
-                    f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
-                )
-            except Exception:
+                thumbnails.append(f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}")
+            except:
                 pass
-    return {"status": result, "unsplash_configured": bool(UNSPLASH_ACCESS_KEY)}
+        result[m] = {
+            "local_count": count,
+            "unsplash_ready": bool(UNSPLASH_ACCESS_KEY),
+            "source": source,
+            "thumbnails": thumbnails,
+        }
+    return {
+        "status": result,
+        "cloudinary_configured": _cloudinary_configured(),
+        "unsplash_configured": bool(UNSPLASH_ACCESS_KEY),
+    }
+
 
 @router.post("/library/upload")
 async def upload_images(
-    model: str             = Form(...),
+    model: str              = Form(...),
     files: list[UploadFile] = File(...),
 ):
-    """上传图片到对应车型图片库"""
-    model_dir = get_model_dir(model)
-    existing  = len(get_local_images(model))
-    saved     = []
-    errors    = []
+    if not _cloudinary_configured():
+        return {"success": False, "errors": ["未配置 Cloudinary，请检查环境变量"],
+                "saved": [], "total_now": 0}
+
+    saved, errors = [], []
+    existing_count = count_local_images(model)
 
     for i, f in enumerate(files):
         ext = os.path.splitext(f.filename)[1].lower()
         if ext not in ALLOWED_EXTENSIONS:
-            errors.append(f"{f.filename}: 不支持的格式（仅支持jpg/png/webp）")
+            errors.append(f"{f.filename}: 不支持的格式（仅 jpg/png/webp）")
             continue
         try:
-            content  = await f.read()
-            # 验证是否是有效图片
-            img = Image.open(io.BytesIO(content))
-            img.verify()
-            # 保存
-            idx      = existing + i + 1
+            content = await f.read()
+            # 验证图片有效性
+            Image.open(io.BytesIO(content)).verify()
+            # 重新读取（verify 会关闭文件）
+            content = await f.read() if len(content) == 0 else content
+            idx = existing_count + i + 1
             filename = f"{idx:02d}_{os.path.splitext(f.filename)[0][:20]}{ext}"
-            save_path = os.path.join(model_dir, filename)
-            with open(save_path, 'wb') as out:
-                out.write(content)
-            saved.append(filename)
+            r = _upload_to_cloudinary(content, model, filename)
+            saved.append(r["url"])
         except Exception as e:
             errors.append(f"{f.filename}: {str(e)}")
 
+    total = count_local_images(model)
     return {
-        "success":    len(saved) > 0,
-        "saved":      saved,
-        "errors":     errors,
-        "total_now":  count_local_images(model),
-        "message":    f"成功上传 {len(saved)} 张，{model} 图片库共 {count_local_images(model)} 张",
+        "success": len(saved) > 0,
+        "saved": saved,
+        "errors": errors,
+        "total_now": total,
+        "message": f"成功上传 {len(saved)} 张到 Cloudinary，{model} 共 {total} 张",
     }
+
 
 @router.delete("/library/clear/{model}")
 def clear_model_images(model: str):
-    """清空某车型的本地图片库"""
-    model_dir = get_model_dir(model)
-    count = 0
-    for f in os.listdir(model_dir):
-        if os.path.splitext(f)[1].lower() in ALLOWED_EXTENSIONS:
-            os.remove(os.path.join(model_dir, f))
-            count += 1
-    return {"success": True, "deleted": count, "message": f"已清空 {model} 的 {count} 张图片"}
+    count = _delete_cloudinary_folder(model)
+    return {"success": True, "deleted": count, "message": f"已从 Cloudinary 清空 {model} 的 {count} 张图片"}
+
 
 @router.get("/library/preview/{model}")
 def preview_library(model: str, count: int = 2):
-    """预览图片库中的图片（返回小缩略图base64）"""
     try:
-        local_imgs = get_local_images(model)
-        if not local_imgs:
-            if UNSPLASH_ACCESS_KEY:
-                source = "Unsplash"
-                # Unsplash只取1张预览，避免卡住
-                img_bytes = get_unsplash_image(model, 0)
-                img = Image.open(io.BytesIO(img_bytes)).resize((300, 300))
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=75)
-                return {"success": True, "source": source, "images": [{
-                    "index": 0,
-                    "b64": f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
-                }]}
-            return {"success": False, "error": "暂无图片，请上传或配置Unsplash Key"}
+        urls = _list_cloudinary_images(model)
+        if urls:
+            previews = []
+            for i, url in enumerate(urls[:count]):
+                try:
+                    resp = requests.get(url, timeout=15)
+                    img = Image.open(io.BytesIO(resp.content)).convert("RGB").resize((300, 300))
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=75)
+                    previews.append({
+                        "index": i,
+                        "b64": f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}",
+                        "ai_generated": False,
+                    })
+                except Exception as e:
+                    print(f"[preview] 下载失败: {e}")
+            if previews:
+                return {"success": True, "images": previews, "source": "Cloudinary ☁️"}
 
-        # 本地图片：直接读文件，不做1088resize（预览用小图就够）
-        source   = "本地图片"
-        selected = local_imgs[:min(count, len(local_imgs))]
-        previews = []
-        for i, p in enumerate(selected):
-            try:
-                img = Image.open(p).convert("RGB").resize((300, 300))
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=75)
-                previews.append({
-                    "index": i,
-                    "b64": f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
-                })
-            except Exception as e:
-                print(f"[preview] 读取失败 {p}: {e}")
-        if not previews:
-            return {"success": False, "error": "图片读取失败"}
-        return {"success": True, "images": previews, "source": source}
+        if UNSPLASH_ACCESS_KEY:
+            img_bytes = _get_unsplash_image(model, 0)
+            img = Image.open(io.BytesIO(img_bytes)).resize((300, 300))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=75)
+            return {"success": True, "source": "Unsplash", "images": [{
+                "index": 0,
+                "b64": f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}",
+                "ai_generated": False,
+            }]}
+        return {"success": False, "error": "暂无图片，请上传图片到图片库"}
     except Exception as e:
         return {"success": False, "error": str(e)}
