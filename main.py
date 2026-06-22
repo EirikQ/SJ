@@ -204,26 +204,118 @@ def post_to_facebook(message):
         data={"message": message, "access_token": token}, timeout=60)
     return resp.json()
 
+def _restore_schedules_from_db():
+    """启动时从数据库恢复所有定时任务，重启不丢。"""
+    try:
+        from experiment import get_conn
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS schedule_log (
+                    job_id TEXT PRIMARY KEY, model TEXT, market TEXT,
+                    language TEXT, post_type TEXT, post_mode TEXT,
+                    hour INT, minute INT, days TEXT, whatsapp TEXT,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    updated_at TIMESTAMPTZ DEFAULT now());
+            """)
+            conn.commit()
+            cur.execute("SELECT * FROM schedule_log")
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        restored = 0
+        for r in rows:
+            rd = dict(zip(cols, r))
+            try:
+                scheduler.add_job(
+                    run_scheduled_post,
+                    trigger=CronTrigger(day_of_week=rd["days"],
+                                        hour=rd["hour"], minute=rd["minute"],
+                                        timezone=DAKAR_TZ),
+                    args=[rd["model"], rd["market"], rd["language"],
+                          rd["post_type"], rd["whatsapp"] or "", rd["post_mode"]],
+                    id=rd["job_id"], replace_existing=True)
+                scheduled_jobs[rd["job_id"]] = {
+                    "model": rd["model"], "market": rd["market"],
+                    "language": rd["language"], "post_type": rd["post_type"],
+                    "post_mode": rd["post_mode"], "days": rd["days"],
+                    "time": f"{rd['hour']:02d}:{rd['minute']:02d}",
+                }
+                restored += 1
+            except Exception as e:
+                print(f"[restore] 任务 {rd['job_id']} 恢复失败: {e}")
+        print(f"[restore] 从数据库恢复 {restored} 个定时任务")
+    except Exception as e:
+        print(f"[restore] 恢复失败(不影响启动): {e}")
+
+
+def _db_count_today():
+    try:
+        from experiment import get_conn
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM post_log_db WHERE posted_date=%s AND success=TRUE",
+                        (date.today().isoformat(),))
+            return cur.fetchone()[0] or 0
+    except: return daily_stats.get(date.today().isoformat(), {}).get("success", 0)
+
+def _db_count_total():
+    try:
+        from experiment import get_conn
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM post_log_db WHERE success=TRUE")
+            return cur.fetchone()[0] or 0
+    except: return len(post_log)
+
+def _ensure_post_log_table():
+    """确保 post_log_db 表存在（启动时调用一次）"""
+    try:
+        from experiment import get_conn
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS post_log_db (
+                    id          BIGSERIAL PRIMARY KEY,
+                    posted_date DATE        NOT NULL,
+                    posted_hour SMALLINT    NOT NULL,
+                    model       TEXT,
+                    language    TEXT,
+                    market      TEXT,
+                    post_type   TEXT,
+                    content_preview TEXT,
+                    success     BOOLEAN     NOT NULL DEFAULT FALSE,
+                    fb_post_id  TEXT,
+                    char_count  INT,
+                    has_emoji   BOOLEAN,
+                    has_hashtag BOOLEAN,
+                    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                CREATE INDEX IF NOT EXISTS idx_pldb_date  ON post_log_db(posted_date);
+                CREATE INDEX IF NOT EXISTS idx_pldb_model ON post_log_db(model);
+            """)
+            conn.commit()
+    except Exception as e:
+        print(f"[post_log_db] 建表失败(不影响发帖): {e}")
+
 def log_post(model, language, market, post_type, content, fb_response):
     today_str = date.today().isoformat()
     now_dakar = datetime.now(DAKAR_TZ)
     success   = "id" in fb_response
     hour      = now_dakar.hour
+    has_emoji = any(ord(c) > 127 for c in content)
+    has_tag   = "#" in content
     entry = {
-        "timestamp":      now_dakar.isoformat(),
-        "date":           today_str,
-        "hour":           hour,
-        "model":          model,
-        "language":       language,
-        "market":         market,
-        "post_type":      post_type,
+        "timestamp":       now_dakar.isoformat(),
+        "date":            today_str,
+        "hour":            hour,
+        "model":           model,
+        "language":        language,
+        "market":          market,
+        "post_type":       post_type,
         "content_preview": content[:80] + "...",
-        "success":        success,
-        "fb_post_id":     fb_response.get("id", ""),
-        "char_count":     len(content),
-        "has_emoji":      any(ord(c) > 127 for c in content),
-        "has_hashtag":    "#" in content,
+        "success":         success,
+        "fb_post_id":      fb_response.get("id", ""),
+        "char_count":      len(content),
+        "has_emoji":       has_emoji,
+        "has_hashtag":     has_tag,
     }
+    # 内存缓存（兼容原有逻辑）
     post_log.append(entry)
     if today_str not in daily_stats:
         daily_stats[today_str] = {
@@ -233,15 +325,28 @@ def log_post(model, language, market, post_type, content, fb_response):
         }
     s = daily_stats[today_str]
     s["posts"] += 1
-    if success:
-        s["success"] += 1
-    else:
-        s["failed"] += 1
+    if success: s["success"] += 1
+    else:       s["failed"]  += 1
     s["models"][model]         = s["models"].get(model, 0) + 1
     s["post_types"][post_type] = s["post_types"].get(post_type, 0) + 1
     s["markets"][market]       = s["markets"].get(market, 0) + 1
     s["languages"][language]   = s["languages"].get(language, 0) + 1
     s["hours"][str(hour)]      = s["hours"].get(str(hour), 0) + 1
+    # 持久化写入数据库（重启不丢）
+    try:
+        from experiment import get_conn
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO post_log_db
+                  (posted_date, posted_hour, model, language, market, post_type,
+                   content_preview, success, fb_post_id, char_count, has_emoji, has_hashtag)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (today_str, hour, model, language, market, post_type,
+                  content[:80]+"...", success, fb_response.get("id",""),
+                  len(content), has_emoji, has_tag))
+            conn.commit()
+    except Exception as e:
+        print(f"[log_post] DB写入失败(不影响发帖): {e}")
 
 def run_scheduled_post(model, market, language, post_type, whatsapp, post_mode="text"):
     print(f"[定时任务] 自动发帖: {model} | {market} | {language} | 模式:{post_mode}")
@@ -297,16 +402,57 @@ def run_scheduled_post(model, market, language, post_type, whatsapp, post_mode="
 # ══════════════════════════════════════════════════════════════
 def generate_detailed_report(target_date: str = None) -> dict:
     today = target_date or date.today().isoformat()
-    s     = daily_stats.get(today, {
-        "posts":0,"success":0,"failed":0,
-        "models":{},"post_types":{},"markets":{},
-        "languages":{},"hours":{}
-    })
 
-    # 近7天数据
-    all_dates = sorted(daily_stats.keys())[-7:]
-    weekly_total   = sum(daily_stats[d]["success"] for d in all_dates)
-    weekly_avg     = round(weekly_total / max(len(all_dates), 1), 1)
+    # 优先从数据库读，降级到内存缓存
+    s = {"posts":0,"success":0,"failed":0,"models":{},"post_types":{},"markets":{},"languages":{},"hours":{}}
+    recent_posts_db = []
+    weekly_total = 0
+    weekly_avg   = 0
+    try:
+        from experiment import get_conn
+        with get_conn() as conn, conn.cursor() as cur:
+            # 今日统计
+            cur.execute("""
+                SELECT model, language, market, post_type, posted_hour, success,
+                       fb_post_id, content_preview, char_count, created_at
+                FROM post_log_db WHERE posted_date=%s ORDER BY created_at DESC
+            """, (today,))
+            rows = cur.fetchall()
+            for r in rows:
+                model_v, lang_v, mkt_v, ptype_v, hr_v, succ_v, fbid_v, prev_v, cc_v, ts_v = r
+                s["posts"] += 1
+                if succ_v: s["success"] += 1
+                else:      s["failed"]  += 1
+                s["models"][model_v]  = s["models"].get(model_v, 0) + 1
+                s["post_types"][ptype_v] = s["post_types"].get(ptype_v, 0) + 1
+                s["markets"][mkt_v]   = s["markets"].get(mkt_v, 0) + 1
+                s["languages"][lang_v] = s["languages"].get(lang_v, 0) + 1
+                s["hours"][str(hr_v)] = s["hours"].get(str(hr_v), 0) + 1
+                recent_posts_db.append({
+                    "timestamp": ts_v.isoformat() if ts_v else "",
+                    "date": today, "hour": hr_v, "model": model_v,
+                    "language": lang_v, "market": mkt_v, "post_type": ptype_v,
+                    "content_preview": prev_v, "success": succ_v,
+                    "fb_post_id": fbid_v or "", "char_count": cc_v or 0,
+                })
+            # 近7天总量
+            cur.execute("""
+                SELECT posted_date, COUNT(*) FILTER (WHERE success) as ok
+                FROM post_log_db
+                WHERE posted_date >= CURRENT_DATE - interval '7 days'
+                GROUP BY posted_date
+            """)
+            wrows = cur.fetchall()
+            weekly_total = sum(r[1] for r in wrows)
+            weekly_avg   = round(weekly_total / max(len(wrows), 1), 1)
+    except Exception as e:
+        print(f"[report] DB读取失败，降级内存: {e}")
+        # 降级：用内存数据
+        s = daily_stats.get(today, s)
+        all_dates  = sorted(daily_stats.keys())[-7:]
+        weekly_total = sum(daily_stats[d]["success"] for d in all_dates)
+        weekly_avg   = round(weekly_total / max(len(all_dates), 1), 1)
+        recent_posts_db = post_log[-20:]
 
     # 车型热度排名
     model_rank = sorted(s["models"].items(), key=lambda x: x[1], reverse=True)
@@ -434,7 +580,7 @@ def generate_detailed_report(target_date: str = None) -> dict:
         "hour_dist":       hour_data,
         "ai_analysis":     ai_advice,
         "ai_schedule":     ai_schedule_json,
-        "recent_posts":    post_log[-20:],
+        "recent_posts":    recent_posts_db[:20],
     }
 
 def run_daily_report():
@@ -511,8 +657,8 @@ def root():
         "deepseek": bool(get_env("DEEPSEEK_API_KEY")),
         "facebook": bool(get_env("FACEBOOK_PAGE_TOKEN")),
         "siliconflow": bool(get_env("SILICONFLOW_API_KEY")),
-        "total_posts_today": daily_stats.get(date.today().isoformat(), {}).get("success", 0),
-        "total_posts_all_time": len(post_log),
+        "total_posts_today": _db_count_today(),
+        "total_posts_all_time": _db_count_total(),
         "active_schedules": len(scheduled_jobs),
     }
 
@@ -648,26 +794,87 @@ def add_schedule(data: ScheduleRequest):
               data.post_type, data.whatsapp, data.post_mode],
         id=job_id, replace_existing=True,
     )
-    scheduled_jobs[job_id] = {
+    job_data = {
         "model":data.model,"market":data.market,"language":data.language,
         "post_type":data.post_type,"time":f"{data.hour:02d}:{data.minute:02d}",
         "days":data.days,"post_mode":data.post_mode,
+        "hour":data.hour,"minute":data.minute,"whatsapp":data.whatsapp,
     }
+    scheduled_jobs[job_id] = job_data
+    # 持久化到数据库
+    try:
+        from experiment import get_conn
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS schedule_log (
+                    job_id TEXT PRIMARY KEY,
+                    model TEXT, market TEXT, language TEXT,
+                    post_type TEXT, post_mode TEXT,
+                    hour INT, minute INT, days TEXT,
+                    whatsapp TEXT,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    updated_at TIMESTAMPTZ DEFAULT now());
+            """)
+            cur.execute("""
+                INSERT INTO schedule_log
+                  (job_id,model,market,language,post_type,post_mode,hour,minute,days,whatsapp)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (job_id) DO UPDATE SET
+                  model=EXCLUDED.model, market=EXCLUDED.market,
+                  language=EXCLUDED.language, post_type=EXCLUDED.post_type,
+                  post_mode=EXCLUDED.post_mode, hour=EXCLUDED.hour,
+                  minute=EXCLUDED.minute, days=EXCLUDED.days,
+                  whatsapp=EXCLUDED.whatsapp, updated_at=now()
+            """, (job_id, data.model, data.market, data.language,
+                  data.post_type, data.post_mode, data.hour, data.minute,
+                  data.days, data.whatsapp))
+            conn.commit()
+    except Exception as e:
+        print(f"[schedule] DB写入失败(不影响任务): {e}")
     return {"success":True,"job_id":job_id}
 
 @app.get("/schedule/list")
 def list_schedules():
-    return {"schedules":scheduled_jobs,"total":len(scheduled_jobs),
-            "best_times":BEST_POST_TIMES}
+    # 优先从数据库读，降级到内存
+    try:
+        from experiment import get_conn
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM schedule_log ORDER BY created_at")
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            db_jobs = {}
+            for r in rows:
+                rd = dict(zip(cols, r))
+                db_jobs[rd["job_id"]] = {
+                    "model": rd["model"], "market": rd["market"],
+                    "language": rd["language"], "post_type": rd["post_type"],
+                    "post_mode": rd["post_mode"], "days": rd["days"],
+                    "time": f"{rd['hour']:02d}:{rd['minute']:02d}",
+                    "hour": rd["hour"], "minute": rd["minute"],
+                    "whatsapp": rd["whatsapp"],
+                }
+            return {"schedules": db_jobs, "total": len(db_jobs),
+                    "best_times": BEST_POST_TIMES}
+    except Exception as e:
+        print(f"[schedule/list] DB读取失败，降级内存: {e}")
+        return {"schedules": scheduled_jobs, "total": len(scheduled_jobs),
+                "best_times": BEST_POST_TIMES}
 
 @app.delete("/schedule/{job_id}")
 def remove_schedule(job_id: str):
+    try: scheduler.remove_job(job_id)
+    except: pass
     if job_id in scheduled_jobs:
-        try: scheduler.remove_job(job_id)
-        except: pass
         del scheduled_jobs[job_id]
-        return {"success":True}
-    return {"success":False,"message":"任务不存在"}
+    # 同时从数据库删除
+    try:
+        from experiment import get_conn
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM schedule_log WHERE job_id=%s", (job_id,))
+            conn.commit()
+    except Exception as e:
+        print(f"[schedule] DB删除失败: {e}")
+    return {"success": True}
 
 @app.post("/schedule/setup-default")
 def setup_default_schedule(whatsapp: str = "+86 134 3393 1311"):
@@ -868,6 +1075,8 @@ app.include_router(experiment_router)
 def _mwm_startup():
     try:
         init_experiment_db()
+        _ensure_post_log_table()
         start_scheduler()
+        _restore_schedules_from_db()
     except Exception as e:
         print("MWM startup failed:", e)
