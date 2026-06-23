@@ -1057,13 +1057,30 @@ def dashboard_environment():
 class ContentIntelligenceIn(BaseModel):
     content_id: int | None = None
     platform: str = "facebook"
-    content_type: str | None = None   # 观点/案例/参数/价格/对比/故事/新闻/客户案例
-    video_style: str | None = None    # 数字人口播/真人口播/实拍/混剪/幻灯片
+    # ── 内容形式（P1）──────────────────────────────────────────
+    content_type: str | None = None
+    # 观点/案例/参数/价格/对比/故事/新闻/客户案例
+    video_style: str | None = None
+    # 数字人口播/真人口播/实拍/混剪/幻灯片
+    production_source: str | None = None
+    # AI_SLIDESHOW / DIGITAL_HUMAN / REAL_PERSON / REAL_SHOOT / AI_MIX / HYBRID
     duration_sec: int | None = None
-    hook_type: str | None = None      # 问题/震惊/价格/故事/数据
+    hook_type: str | None = None
+    # 问题/震惊/价格/故事/数据
     country: str | None = None
     car_model: str | None = None
-    # 平台指标（可手动填，也可由 FB Insights 自动同步）
+    # ── AI 分析能力预留（P2）──────────────────────────────────
+    analysis_source: str = "manual"       # manual / ai
+    content_summary: str | None = None
+    hook_text: str | None = None
+    content_tags: list | None = None      # ["案例","价格","故事"]
+    emotion_type: str | None = None
+    # RATIONAL / TRUST / AUTHORITY / CURIOSITY / FEAR / GREED / SCARCITY
+    target_audience: str | None = None
+    # DEALER / END_CUSTOMER / IMPORTER / CAR_TRADER / ENTERPRISE
+    cta_type: str | None = None
+    # WHATSAPP / DM / COMMENT / FOLLOW / INQUIRY
+    # ── 平台指标 ──────────────────────────────────────────────
     impressions: int = 0
     reach: int = 0
     retention_3s: float = 0
@@ -1079,38 +1096,47 @@ class ContentIntelligenceIn(BaseModel):
 
 @router.post("/content-intelligence")
 def create_content_intelligence(body: ContentIntelligenceIn):
-    """L1: 录入内容智能数据（内容形式 + 平台指标）。"""
-    # 如果关联了 content_id，自动补充 content_type/country/car_model
+    """L1 V2: 录入内容智能数据（内容形式 + 生产方式 + AI预留字段 + 平台指标）。"""
     ct = body.content_type; country = body.country; model = body.car_model
     if body.content_id and not (ct and country and model):
         try:
             with get_conn() as conn, conn.cursor() as cur:
-                cur.execute("SELECT content_type, country, car_model FROM content_log WHERE id=%s",
-                            (body.content_id,))
+                cur.execute(
+                    "SELECT content_type, country, car_model FROM content_log WHERE id=%s",
+                    (body.content_id,))
                 row = cur.fetchone()
                 if row:
-                    ct = ct or row[0]
-                    country = country or row[1]
-                    model = model or row[2]
+                    ct = ct or row[0]; country = country or row[1]; model = model or row[2]
         except: pass
+
+    import json as _json
+    tags = _json.dumps(body.content_tags) if body.content_tags else '[]'
 
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             INSERT INTO content_intelligence
-              (content_id, platform, content_type, video_style, duration_sec,
-               hook_type, country, car_model, impressions, reach,
-               retention_3s, retention_5s, avg_watch_time, completion_rate,
-               like_rate, comment_rate, share_rate, save_rate, follow_rate)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+              (content_id, platform, content_type, video_style, production_source,
+               duration_sec, hook_type, country, car_model,
+               analysis_source, content_summary, hook_text,
+               content_tags, emotion_type, target_audience, cta_type,
+               impressions, reach, retention_3s, retention_5s,
+               avg_watch_time, completion_rate, like_rate, comment_rate,
+               share_rate, save_rate, follow_rate)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
         """, (body.content_id, body.platform, ct, body.video_style,
-              body.duration_sec, body.hook_type, country, model,
-              body.impressions, body.reach, body.retention_3s, body.retention_5s,
-              body.avg_watch_time, body.completion_rate, body.like_rate,
-              body.comment_rate, body.share_rate, body.save_rate, body.follow_rate))
+              body.production_source, body.duration_sec, body.hook_type,
+              country, model, body.analysis_source, body.content_summary,
+              body.hook_text, tags, body.emotion_type, body.target_audience,
+              body.cta_type, body.impressions, body.reach,
+              body.retention_3s, body.retention_5s, body.avg_watch_time,
+              body.completion_rate, body.like_rate, body.comment_rate,
+              body.share_rate, body.save_rate, body.follow_rate))
         cid = cur.fetchone()[0]
         conn.commit()
-    return {"content_intelligence_id": cid, "content_type": ct}
+    return {"content_intelligence_id": cid, "content_type": ct,
+            "production_source": body.production_source}
 
 
 @router.get("/content-intelligence")
@@ -1136,41 +1162,92 @@ def list_content_intelligence(content_type: str | None = None,
 
 
 @router.post("/content-experiment/run")
-def run_content_experiment(test_type: str, control_type: str,
-                            metric: str = "completion_rate", days: int = 30):
-    """L1: 内容实验——对比两种内容类型的平台指标。"""
+def run_content_experiment(test_value: str, control_value: str,
+                            dimension: str = "content_type",
+                            metric: str = "completion_rate",
+                            days: int = 30):
+    """L1 V2: 内容实验——支持多维度对比。
+    dimension: content_type / video_style / production_source /
+               hook_type / emotion_type / target_audience / cta_type
+    metric:    completion_rate / retention_3s / avg_engagement /
+               inquiry_rate / deal_rate / profit_per_content
+    """
+    VALID_DIMS = {"content_type","video_style","production_source",
+                  "hook_type","emotion_type","target_audience","cta_type"}
+    if dimension not in VALID_DIMS:
+        raise HTTPException(400, f"dimension 必须是 {VALID_DIMS} 之一")
+
     with get_conn() as conn, conn.cursor() as cur:
-        def stats(ct):
+        def stats(val):
+            # 平台指标：直接从 content_intelligence
             cur.execute(f"""
                 SELECT COUNT(*) n,
                        COALESCE(AVG(completion_rate),0) cr,
                        COALESCE(AVG(retention_3s),0) r3,
-                       COALESCE(AVG(like_rate),0) lr,
-                       COALESCE(AVG(comment_rate),0) cmr,
-                       COALESCE(AVG(share_rate),0) sr,
+                       COALESCE(AVG(like_rate+comment_rate+share_rate),0) eng,
                        COALESCE(AVG(impressions),0) imp
                 FROM content_intelligence
-                WHERE content_type=%s AND synced_at>=now()-interval '{days} days'
-            """, (ct,))
+                WHERE {dimension}=%s
+                  AND synced_at>=now()-interval '{days} days'
+            """, (val,))
             r = cur.fetchone()
-            return {"content_type":ct,"n":r[0],"completion_rate":round(float(r[1]),4),
-                    "retention_3s":round(float(r[2]),4),"like_rate":round(float(r[3]),4),
-                    "comment_rate":round(float(r[4]),4),"share_rate":round(float(r[5]),4),
-                    "avg_impressions":round(float(r[6]),1)}
-        test = stats(test_type); ctrl = stats(control_type)
+            n,cr,r3,eng,imp = r
+            # 商业指标：JOIN 归因链路
+            cur.execute(f"""
+                SELECT COUNT(DISTINCT l.id) leads,
+                       COUNT(DISTINCT d.id) deals,
+                       COALESCE(SUM(p.profit),0) profit,
+                       COALESCE(SUM(ci.impressions),0) total_imp
+                FROM content_intelligence ci
+                LEFT JOIN content_log c ON c.id=ci.content_id
+                LEFT JOIN lead_log l    ON l.content_id=c.id
+                LEFT JOIN deal_log d    ON d.lead_id=l.id
+                LEFT JOIN profit_log p  ON p.content_id=c.id
+                WHERE ci.{dimension}=%s
+                  AND ci.synced_at>=now()-interval '{days} days'
+            """, (val,))
+            b = cur.fetchone()
+            leads,deals,profit,total_imp = b
+            profit = float(profit or 0); total_imp = float(total_imp or 0)
+            return {
+                "value": val, "n": n or 0,
+                "completion_rate": round(float(cr or 0),4),
+                "retention_3s":    round(float(r3 or 0),4),
+                "avg_engagement":  round(float(eng or 0),4),
+                "avg_impressions": round(float(imp or 0),1),
+                "leads": leads or 0, "deals": deals or 0,
+                "total_profit": profit,
+                "inquiry_rate": round((leads or 0)/total_imp,6) if total_imp else 0,
+                "deal_rate":    round((deals or 0)/(leads or 1),4) if (leads or 0)>0 else 0,
+                "profit_per_content": round(profit/(n or 1),2) if (n or 0)>0 else 0,
+            }
+
+        test = stats(test_value); ctrl = stats(control_value)
         metric_val = test.get(metric,0); ctrl_val = ctrl.get(metric,0)
         lift = round(metric_val - ctrl_val, 4)
-        conclusion = "数据不足" if min(test["n"],ctrl["n"])<3 \
-            else ("成立" if lift>0 else "推翻")
-    return {"test": test, "control": ctrl, "metric": metric,
-            "lift": lift, "conclusion": conclusion,
-            "note": "L1 内容实验：目标为平台指标（非利润）。与L2交叉验证方可得出最终结论。"}
+        rel  = round((metric_val/ctrl_val-1),4) if ctrl_val else None
+        min_n = min(test["n"], ctrl["n"])
+        conf  = round(min(min_n/10.0,1.0)*(0.4+0.6*min(abs(rel or 0),1.0)),3)
+        if min_n < 3: conclusion = "数据不足"
+        elif lift > 0 and conf >= 0.4: conclusion = "成立"
+        elif lift <= 0 and conf >= 0.4: conclusion = "推翻"
+        else: conclusion = "不显著"
+
+    return {
+        "dimension": dimension, "metric": metric,
+        "test": test, "control": ctrl,
+        "lift_abs": lift, "lift_rel": rel,
+        "confidence": conf, "conclusion": conclusion,
+        "insight": f"{test_value} vs {control_value}：{metric} 差异 {lift:+.4f}，置信度 {conf:.2f}",
+        "note": "平台指标反映算法喜好，利润指标反映商业价值。两者共同验证方为完整结论。"
+    }
 
 
 @router.get("/dashboard/content")
 def dashboard_content(days: int = 30):
-    """L1: Content Dashboard。"""
+    """L1 V2: Content Dashboard——内容类型/生产方式/标签/互动排行。"""
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # 总体指标
         cur.execute(f"""
             SELECT COUNT(*) total,
                    COALESCE(AVG(completion_rate),0) avg_cr,
@@ -1181,10 +1258,10 @@ def dashboard_content(days: int = 30):
             WHERE synced_at >= now()-interval '{days} days'
         """)
         s = cur.fetchone()
-        # 按内容类型排行
+
+        # 内容类型排行（完播率 + 互动率）
         cur.execute(f"""
-            SELECT content_type,
-                   COUNT(*) n,
+            SELECT content_type, COUNT(*) n,
                    COALESCE(AVG(completion_rate),0) avg_cr,
                    COALESCE(AVG(retention_3s),0) avg_r3,
                    COALESCE(AVG(like_rate+comment_rate+share_rate),0) avg_eng
@@ -1194,10 +1271,43 @@ def dashboard_content(days: int = 30):
             GROUP BY content_type ORDER BY avg_cr DESC
         """)
         by_type = cur.fetchall()
-        # 按 hook 类型排行
+
+        # 生产方式分布
         cur.execute(f"""
-            SELECT hook_type,
-                   COUNT(*) n,
+            SELECT production_source, COUNT(*) n,
+                   COALESCE(AVG(completion_rate),0) avg_cr,
+                   COALESCE(AVG(like_rate+comment_rate+share_rate),0) avg_eng
+            FROM content_intelligence
+            WHERE synced_at >= now()-interval '{days} days'
+              AND production_source IS NOT NULL
+            GROUP BY production_source ORDER BY avg_cr DESC
+        """)
+        by_production = cur.fetchall()
+
+        # Production ROI Ranking（生产方式 × 完播/互动/询盘/利润）
+        cur.execute(f"""
+            SELECT ci.production_source,
+                   COUNT(DISTINCT ci.id) content_count,
+                   COALESCE(AVG(ci.completion_rate),0) avg_cr,
+                   COALESCE(AVG(ci.like_rate+ci.comment_rate+ci.share_rate),0) avg_eng,
+                   COUNT(DISTINCT l.id) leads,
+                   COUNT(DISTINCT d.id) deals,
+                   COALESCE(SUM(p.profit),0) profit
+            FROM content_intelligence ci
+            LEFT JOIN content_log c ON c.id=ci.content_id
+            LEFT JOIN lead_log l    ON l.content_id=c.id
+            LEFT JOIN deal_log d    ON d.lead_id=l.id
+            LEFT JOIN profit_log p  ON p.content_id=c.id
+            WHERE ci.synced_at >= now()-interval '{days} days'
+              AND ci.production_source IS NOT NULL
+            GROUP BY ci.production_source
+            ORDER BY profit DESC, avg_cr DESC
+        """)
+        production_roi = cur.fetchall()
+
+        # hook 类型排行
+        cur.execute(f"""
+            SELECT hook_type, COUNT(*) n,
                    COALESCE(AVG(retention_3s),0) avg_r3,
                    COALESCE(AVG(completion_rate),0) avg_cr
             FROM content_intelligence
@@ -1206,14 +1316,41 @@ def dashboard_content(days: int = 30):
             GROUP BY hook_type ORDER BY avg_r3 DESC
         """)
         by_hook = cur.fetchall()
+
+        # 内容标签排行（从 JSONB 数组展开）
+        cur.execute(f"""
+            SELECT tag, COUNT(*) n,
+                   COALESCE(AVG(ci.completion_rate),0) avg_cr
+            FROM content_intelligence ci,
+                 jsonb_array_elements_text(ci.content_tags) AS tag
+            WHERE ci.synced_at >= now()-interval '{days} days'
+            GROUP BY tag ORDER BY n DESC LIMIT 15
+        """)
+        by_tag = cur.fetchall()
+
+        # 情绪类型分布
+        cur.execute(f"""
+            SELECT emotion_type, COUNT(*) n,
+                   COALESCE(AVG(completion_rate),0) avg_cr
+            FROM content_intelligence
+            WHERE synced_at >= now()-interval '{days} days'
+              AND emotion_type IS NOT NULL
+            GROUP BY emotion_type ORDER BY avg_cr DESC
+        """)
+        by_emotion = cur.fetchall()
+
     return {
-        "total_content": s["total"] or 0,
-        "avg_completion_rate": round(float(s["avg_cr"] or 0), 4),
-        "avg_retention_3s": round(float(s["avg_r3"] or 0), 4),
-        "avg_engagement_rate": round(float(s["avg_engagement"] or 0), 4),
-        "avg_impressions": round(float(s["avg_imp"] or 0), 1),
-        "by_content_type": [dict(r) for r in by_type],
-        "by_hook_type": [dict(r) for r in by_hook],
+        "total_content":        s["total"] or 0,
+        "avg_completion_rate":  round(float(s["avg_cr"] or 0), 4),
+        "avg_retention_3s":     round(float(s["avg_r3"] or 0), 4),
+        "avg_engagement_rate":  round(float(s["avg_engagement"] or 0), 4),
+        "avg_impressions":      round(float(s["avg_imp"] or 0), 1),
+        "by_content_type":      [dict(r) for r in by_type],
+        "by_production_source": [dict(r) for r in by_production],
+        "production_roi":       [dict(r) for r in production_roi],
+        "by_hook_type":         [dict(r) for r in by_hook],
+        "by_content_tag":       [dict(r) for r in by_tag],
+        "by_emotion_type":      [dict(r) for r in by_emotion],
     }
 
 
@@ -1503,6 +1640,42 @@ def dashboard_knowledge():
         "counter_examples_30d": counters,
         "world_model_score": wm_score,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# P3: Content Analyzer 占位接口（不实现任何分析逻辑）
+# ─────────────────────────────────────────────────────────────────────
+class AnalyzeContentIn(BaseModel):
+    content_id: int
+    media_url: str | None = None
+
+
+@router.post("/content-analyzer/submit")
+def submit_content_for_analysis(body: AnalyzeContentIn):
+    """P3 占位：提交内容到分析队列。自动分析逻辑待后续实现。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO content_analyzer_queue (content_id, media_url, status)
+            VALUES (%s,%s,'pending') RETURNING id
+        """, (body.content_id, body.media_url))
+        qid = cur.fetchone()[0]
+        conn.commit()
+    return {"queue_id": qid, "status": "pending",
+            "note": "Content Analyzer 自动分析功能待后续实现。当前仅入队，不执行分析。"}
+
+
+@router.get("/content-analyzer/queue")
+def get_analyzer_queue():
+    """P3 占位：查看分析队列。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT q.*, c.content_type, c.car_model
+            FROM content_analyzer_queue q
+            LEFT JOIN content_log c ON c.id=q.content_id
+            ORDER BY q.created_at DESC LIMIT 50
+        """)
+        return {"queue": cur.fetchall(), "status": "placeholder",
+                "note": "自动分析（字幕/Hook/分类/标签/情绪/CTA识别）待后续实现。"}
 
 
 # ─────────────────────────────────────────────────────────────────────
