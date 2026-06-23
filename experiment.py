@@ -567,9 +567,23 @@ def create_deal(body: DealIn):
 # ─────────────────────────────────────────────────────────────────────
 # Layer 3: 规律提取
 # ─────────────────────────────────────────────────────────────────────
+def _get_pattern_maturity(sample_size: int) -> tuple:
+    """Sample Size Guard: 根据样本量返回 (maturity, label, allow_prediction)"""
+    if sample_size < 10:
+        return ("OBSERVING",      "观察中",     False)
+    elif sample_size < 30:
+        return ("PRELIMINARY",    "初步规律",   True)
+    elif sample_size <= 100:
+        return ("VALIDATED",      "可信规律",   True)
+    else:
+        return ("HIGH_CONFIDENCE","高可信规律", True)
+
+
 def _extract_patterns():
-    """每周自动运行：从归因链路提取规律，写入 pattern_library。"""
+    """每周自动运行：从归因链路提取规律，写入 pattern_library。
+    Sample Size Guard：样本 < 10 只记录为「观察信号」，不输出「发现规律」。"""
     patterns_saved = 0
+    signals_saved  = 0
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         # 按内容类型统计完整归因指标
         cur.execute("""
@@ -594,24 +608,31 @@ def _extract_patterns():
         rows = cur.fetchall()
 
         for r in rows:
-            if not r["content_type"] or r["lead_count"] < 2:
-                continue
-            pname = f"{r['content_type']}内容利润规律"
-            profit_per_lead = (float(r["total_profit"]) / r["lead_count"]) if r["lead_count"] else 0
-            hq_rate = r["hq_lead_count"] / r["lead_count"] if r["lead_count"] else 0
-            conf = min(r["lead_count"] / 10.0, 1.0) * (0.5 + 0.5 * min(r["profit_count"] / 5.0, 1.0))
-
+            if not r["content_type"]: continue
+            sample_n = r["lead_count"] or 0
+            maturity, label, allow_pred = _get_pattern_maturity(sample_n)
+            profit_per_lead = float(r["total_profit"]) / max(sample_n, 1)
+            hq_rate = (r["hq_lead_count"] or 0) / max(sample_n, 1)
+            conf = min(sample_n / 10.0, 1.0) * (0.5 + 0.5 * min((r["profit_count"] or 0) / 5.0, 1.0))
+            # 样本不足：记为「观察信号」，不输出「规律」
+            pname = (f"{r['content_type']}内容利润规律"
+                     if maturity != "OBSERVING"
+                     else f"{r['content_type']}内容观察信号（样本不足）")
             cur.execute("""
                 INSERT INTO pattern_library
-                  (pattern_name,description,dimension,dimension_value,
-                   metric,effect_size,support_count,confidence,profit_contribution)
-                VALUES (%s,%s,'content_type',%s,'profit_per_lead',%s,%s,%s,%s)
+                  (pattern_name, description, dimension, dimension_value,
+                   metric, effect_size, support_count, confidence,
+                   profit_contribution, sample_size, pattern_maturity)
+                VALUES (%s,%s,'content_type',%s,'profit_per_lead',%s,%s,%s,%s,%s,%s)
                 ON CONFLICT DO NOTHING
             """, (pname,
-                  f"{r['content_type']}类内容每条询盘平均利润 ${profit_per_lead:.0f}，高质量询盘率 {hq_rate:.1%}",
+                  f"[{label}] {r['content_type']}类内容每条询盘平均利润 ${profit_per_lead:.0f}，"
+                  f"高质量询盘率 {hq_rate:.1%}，样本 {sample_n} 条",
                   r["content_type"], round(profit_per_lead, 2),
-                  r["lead_count"], round(conf, 3), float(r["total_profit"])))
-            patterns_saved += 1
+                  sample_n, round(conf, 3), float(r["total_profit"]),
+                  sample_n, maturity))
+            if maturity == "OBSERVING": signals_saved += 1
+            else: patterns_saved += 1
 
         # 按国家提取规律
         cur.execute("""
@@ -619,22 +640,32 @@ def _extract_patterns():
                    COUNT(DISTINCT lead_id) AS leads
             FROM profit_log WHERE created_at >= now()-interval '90 days'
             AND country IS NOT NULL
-            GROUP BY country HAVING COUNT(*)>=2
+            GROUP BY country
         """)
         for r in cur.fetchall():
+            sample_n = r["deals"] or 0
+            maturity, label, _ = _get_pattern_maturity(sample_n)
+            pname = (f"{r['country']}市场利润规律"
+                     if maturity != "OBSERVING"
+                     else f"{r['country']}市场观察信号（样本不足）")
             cur.execute("""
                 INSERT INTO pattern_library
-                  (pattern_name,dimension,dimension_value,metric,
-                   effect_size,support_count,confidence,profit_contribution)
-                VALUES (%s,'country',%s,'profit_per_deal',%s,%s,%s,%s)
+                  (pattern_name, dimension, dimension_value, metric,
+                   effect_size, support_count, confidence, profit_contribution,
+                   sample_size, pattern_maturity)
+                VALUES (%s,'country',%s,'profit_per_deal',%s,%s,%s,%s,%s,%s)
                 ON CONFLICT DO NOTHING
-            """, (f"{r['country']}市场利润规律", r["country"],
-                  round(float(r["profit"])/r["deals"],2) if r["deals"] else 0,
-                  r["deals"], round(min(r["deals"]/5.0,1.0)*0.6, 3), float(r["profit"])))
-            patterns_saved += 1
+            """, (pname, r["country"],
+                  round(float(r["profit"])/max(sample_n,1), 2),
+                  sample_n, round(min(sample_n/5.0,1.0)*0.6, 3), float(r["profit"]),
+                  sample_n, maturity))
+            if maturity == "OBSERVING": signals_saved += 1
+            else: patterns_saved += 1
 
         conn.commit()
-    return {"patterns_extracted": patterns_saved}
+    return {"patterns_extracted": patterns_saved,
+            "signals_recorded": signals_saved,
+            "note": "样本 < 10 的记录为观察信号，不进入预测系统。"}
 
 
 @router.post("/patterns/extract")
@@ -1502,8 +1533,8 @@ def verify_prediction(pid: int, body: VerifyPredictionIn):
 
 @router.post("/patterns/extract-l1")
 def extract_l1_patterns():
-    """L3: 从 content_intelligence 提取 L1 内容规律。"""
-    saved = 0
+    """L3: 从 content_intelligence 提取 L1 内容规律（含 Sample Size Guard）。"""
+    saved = signals = 0
     with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""
             SELECT content_type, COUNT(*) n,
@@ -1512,23 +1543,31 @@ def extract_l1_patterns():
             FROM content_intelligence
             WHERE content_type IS NOT NULL
               AND synced_at >= now()-interval '90 days'
-            GROUP BY content_type HAVING COUNT(*)>=3
+            GROUP BY content_type
         """)
         for r in cur.fetchall():
-            pname = f"{r['content_type']}内容完播规律"
-            conf = round(min(r["n"]/10.0, 1.0) * 0.7, 3)
+            sample_n = r["n"] or 0
+            maturity, label, _ = _get_pattern_maturity(sample_n)
+            pname = (f"{r['content_type']}内容完播规律"
+                     if maturity != "OBSERVING"
+                     else f"{r['content_type']}内容完播观察信号（样本不足）")
+            conf = round(min(sample_n/10.0, 1.0) * 0.7, 3)
             cur.execute("""
                 INSERT INTO pattern_library
                   (pattern_name, description, dimension, dimension_value,
-                   metric, effect_size, support_count, confidence, profit_contribution)
-                VALUES (%s,%s,'content_type',%s,'completion_rate',%s,%s,%s,0)
+                   metric, effect_size, support_count, confidence,
+                   profit_contribution, sample_size, pattern_maturity)
+                VALUES (%s,%s,'content_type',%s,'completion_rate',%s,%s,%s,0,%s,%s)
                 ON CONFLICT DO NOTHING
             """, (pname,
-                  f"{r['content_type']}完播率均值{float(r['cr'] or 0):.1%}，3秒留存{float(r['r3'] or 0):.1%}",
-                  r["content_type"], round(float(r["cr"] or 0),4), r["n"], conf))
-            saved += 1
+                  f"[{label}] {r['content_type']}完播率均值{float(r['cr'] or 0):.1%}，"
+                  f"3秒留存{float(r['r3'] or 0):.1%}，样本 {sample_n} 条",
+                  r["content_type"], round(float(r["cr"] or 0),4),
+                  sample_n, conf, sample_n, maturity))
+            if maturity == "OBSERVING": signals += 1
+            else: saved += 1
         conn.commit()
-    return {"patterns_extracted": saved, "layer": "L1"}
+    return {"patterns_extracted": saved, "signals_recorded": signals, "layer": "L1"}
 
 
 @router.post("/patterns/extract-cross")
@@ -1705,4 +1744,372 @@ def dashboard_decision():
         "next_week_recommendation": None,
         "status": "placeholder",
         "note": "L4 Decision Engine 占位。待 L3 规律库达到 20+ 条高置信规律后开始实现。"
+    }
+
+
+# =====================================================================
+# World Model V1.1 — 模块1: Sample Size Guard API
+# =====================================================================
+@router.get("/patterns/maturity")
+def list_patterns_by_maturity():
+    """按成熟度分层展示规律：高可信/可信/初步/观察信号。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT id, pattern_name, description, dimension, dimension_value,
+                   sample_size, confidence, pattern_maturity, status,
+                   profit_contribution, prediction_count, prediction_success
+            FROM pattern_library
+            ORDER BY
+                CASE pattern_maturity
+                    WHEN 'HIGH_CONFIDENCE' THEN 1
+                    WHEN 'VALIDATED'       THEN 2
+                    WHEN 'PRELIMINARY'     THEN 3
+                    WHEN 'OBSERVING'       THEN 4
+                    ELSE 5
+                END,
+                confidence DESC
+        """)
+        rows = cur.fetchall()
+    by_maturity = {"HIGH_CONFIDENCE":[], "VALIDATED":[], "PRELIMINARY":[], "OBSERVING":[]}
+    for r in rows:
+        m = r.get("pattern_maturity") or "OBSERVING"
+        by_maturity.setdefault(m, []).append(dict(r))
+    return {
+        "by_maturity": by_maturity,
+        "summary": {k: len(v) for k,v in by_maturity.items()},
+        "note": "样本 < 10 的为观察信号，不进入预测系统。样本 10-30 为初步规律，谨慎参考。"
+    }
+
+
+# =====================================================================
+# World Model V1.1 — 模块2: Data Quality Score
+# =====================================================================
+class DataQualityInput(BaseModel):
+    actual_lead_count: int = 0    # 实际收到询盘数（人工填）
+    actual_deal_count: int = 0    # 实际成交数（人工填）
+    notes: str | None = None
+
+
+@router.post("/data-quality/measure")
+def measure_data_quality(body: DataQualityInput):
+    """计算今日数据质量评分，写入 data_quality_metrics。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        # 内容完整率：已录入CI / 已发布帖数
+        cur.execute("SELECT COUNT(*) FROM content_log WHERE DATE(posted_at)=CURRENT_DATE")
+        published = cur.fetchone()[0] or 0
+        cur.execute("SELECT COUNT(*) FROM content_intelligence WHERE DATE(synced_at)=CURRENT_DATE")
+        recorded_ci = cur.fetchone()[0] or 0
+        content_rate = round(recorded_ci / published, 4) if published else 0
+
+        # 询盘完整率
+        cur.execute("SELECT COUNT(*) FROM lead_log WHERE DATE(created_at)=CURRENT_DATE")
+        recorded_leads = cur.fetchone()[0] or 0
+        lead_rate = round(recorded_leads / body.actual_lead_count, 4) if body.actual_lead_count else 0
+
+        # 报价完整率（有询盘且已跟进报价）
+        cur.execute("""SELECT COUNT(DISTINCT l.id) FROM lead_log l JOIN quotation_log q ON q.lead_id=l.id
+                       WHERE DATE(l.created_at)=CURRENT_DATE""")
+        quoted = cur.fetchone()[0] or 0
+        quote_rate = round(quoted / max(recorded_leads,1), 4) if recorded_leads else 0
+
+        # 成交完整率
+        cur.execute("SELECT COUNT(*) FROM deal_log WHERE DATE(close_time)=CURRENT_DATE")
+        recorded_deals = cur.fetchone()[0] or 0
+        deal_rate = round(recorded_deals / body.actual_deal_count, 4) if body.actual_deal_count else 0
+
+        # 利润完整率
+        cur.execute("SELECT COUNT(*) FROM profit_log WHERE DATE(created_at)=CURRENT_DATE")
+        recorded_profit = cur.fetchone()[0] or 0
+        profit_rate = round(recorded_profit / body.actual_deal_count, 4) if body.actual_deal_count else 0
+
+        # 综合评分（加权）
+        score = round((
+            content_rate * 25 +
+            lead_rate    * 35 +
+            deal_rate    * 25 +
+            profit_rate  * 15
+        ), 1)
+        if score >= 90:   level = "EXCELLENT"
+        elif score >= 80: level = "GOOD"
+        elif score >= 60: level = "FAIR"
+        else:             level = "DANGER"
+
+        cur.execute("""
+            INSERT INTO data_quality_metrics
+              (measured_date, content_completion_rate, lead_completion_rate,
+               quote_completion_rate, deal_completion_rate, profit_completion_rate,
+               published_content_count, recorded_content_count,
+               actual_lead_count, recorded_lead_count,
+               actual_deal_count, recorded_deal_count,
+               overall_score, quality_level, notes)
+            VALUES (CURRENT_DATE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT DO NOTHING
+        """, (content_rate, lead_rate, quote_rate, deal_rate, profit_rate,
+              published, recorded_ci, body.actual_lead_count, recorded_leads,
+              body.actual_deal_count, recorded_deals, score, level, body.notes))
+        conn.commit()
+
+    return {
+        "overall_score": score,
+        "quality_level": level,
+        "breakdown": {
+            "content": f"{content_rate:.1%} ({recorded_ci}/{published})",
+            "lead":    f"{lead_rate:.1%} ({recorded_leads}/{body.actual_lead_count})",
+            "quote":   f"{quote_rate:.1%}",
+            "deal":    f"{deal_rate:.1%} ({recorded_deals}/{body.actual_deal_count})",
+            "profit":  f"{profit_rate:.1%}",
+        },
+        "allow_pattern_extraction": score >= 80,
+        "warning": None if score >= 80 else "⚠️ 数据质量不足（<80分），规律提取已暂停，请补录数据后再提取。"
+    }
+
+
+@router.get("/data-quality/history")
+def get_data_quality_history(days: int = 30):
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT * FROM data_quality_metrics
+            WHERE measured_date >= CURRENT_DATE - interval '%s days'
+            ORDER BY measured_date DESC
+        """ % days)
+        rows = cur.fetchall()
+    latest = dict(rows[0]) if rows else None
+    return {
+        "latest": latest,
+        "history": [dict(r) for r in rows],
+        "allow_pattern_extraction": (latest["overall_score"] >= 80) if latest else False,
+    }
+
+
+@router.get("/data-quality/dashboard")
+def data_quality_dashboard():
+    """数据质量仪表盘：综合评分 + 各层完整率 + 是否允许规律提取。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT * FROM data_quality_metrics ORDER BY measured_date DESC LIMIT 1
+        """)
+        latest = cur.fetchone()
+        cur.execute("""
+            SELECT AVG(overall_score) avg_score
+            FROM data_quality_metrics
+            WHERE measured_date >= CURRENT_DATE - interval '7 days'
+        """)
+        week = cur.fetchone()
+    if not latest:
+        return {"status": "no_data", "note": "尚未进行数据质量评估，请调用 /data-quality/measure 录入。"}
+    score = float(latest["overall_score"] or 0)
+    return {
+        "overall_score":    score,
+        "quality_level":    latest["quality_level"],
+        "week_avg_score":   round(float(week["avg_score"] or 0), 1),
+        "allow_pattern_extraction": score >= 80,
+        "content_rate":  float(latest["content_completion_rate"] or 0),
+        "lead_rate":     float(latest["lead_completion_rate"] or 0),
+        "deal_rate":     float(latest["deal_completion_rate"] or 0),
+        "profit_rate":   float(latest["profit_completion_rate"] or 0),
+        "measured_date": latest["measured_date"],
+        "warning": None if score >= 80 else "⚠️ 数据质量低于80分，Knowledge Layer已暂停自动规律提取。请补录数据。"
+    }
+
+
+# =====================================================================
+# World Model V1.1 — 模块3: Pattern Health Monitor
+# =====================================================================
+@router.post("/patterns/health/check")
+def check_pattern_health():
+    """计算所有活跃规律的健康度（准确率趋势），写入 pattern_health。"""
+    updated = 0
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id FROM pattern_library WHERE status='active'")
+        pattern_ids = [r["id"] for r in cur.fetchall()]
+        for pid in pattern_ids:
+            def acc(days):
+                cur.execute("""
+                    SELECT COUNT(*) total,
+                           COUNT(*) FILTER (WHERE status='success') success
+                    FROM prediction_log
+                    WHERE pattern_id=%s
+                      AND verified_time >= now()-interval '%s days'
+                      AND verified_time IS NOT NULL
+                """ % (pid, days))
+                r = cur.fetchone()
+                t = r["total"] or 0; s = r["success"] or 0
+                return round(s/t, 4) if t else None
+            a30 = acc(30); a60 = acc(60); a90 = acc(90)
+            # 趋势
+            vals = [v for v in [a90, a60, a30] if v is not None]
+            if len(vals) >= 2:
+                trend = "UP" if vals[-1] > vals[0] else ("DOWN" if vals[-1] < vals[0] else "FLAT")
+            else:
+                trend = "FLAT"
+            # 连续下降次数（从 pattern_health 历史记录）
+            cur.execute("""
+                SELECT consecutive_down FROM pattern_health
+                WHERE pattern_id=%s ORDER BY measured_at DESC LIMIT 1
+            """, (pid,))
+            prev = cur.fetchone()
+            prev_down = (prev["consecutive_down"] or 0) if prev else 0
+            consec_down = prev_down + 1 if trend == "DOWN" else 0
+            health = "HEALTHY"
+            if consec_down >= 5:   health = "INVALID"
+            elif consec_down >= 3: health = "WEAKENING"
+            cur.execute("""
+                INSERT INTO pattern_health
+                  (pattern_id, last_30d_accuracy, last_60d_accuracy, last_90d_accuracy,
+                   trend, consecutive_down, health_status)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """, (pid, a30, a60, a90, trend, consec_down, health))
+            # 同步更新规律状态
+            if health == "INVALID":
+                cur.execute("UPDATE pattern_library SET status='overturned' WHERE id=%s", (pid,))
+            elif health == "WEAKENING":
+                cur.execute("UPDATE pattern_library SET status='weakened' WHERE id=%s", (pid,))
+            updated += 1
+        conn.commit()
+    return {"patterns_checked": updated}
+
+
+@router.get("/patterns/health/report")
+def pattern_health_report():
+    """本周规律健康报告：失效/弱化/新增/健康。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT p.id, p.pattern_name, p.sample_size, p.confidence,
+                   p.pattern_maturity, p.status,
+                   ph.trend, ph.health_status, ph.consecutive_down,
+                   ph.last_30d_accuracy, ph.measured_at
+            FROM pattern_library p
+            LEFT JOIN LATERAL (
+                SELECT * FROM pattern_health WHERE pattern_id=p.id
+                ORDER BY measured_at DESC LIMIT 1
+            ) ph ON TRUE
+            ORDER BY ph.health_status, p.confidence DESC
+        """)
+        rows = cur.fetchall()
+        new_p  = [r for r in rows if r["status"]=="active" and
+                  r.get("measured_at") and
+                  str(r["measured_at"]) > str(datetime.utcnow() - timedelta(days=7))]
+        weak   = [r for r in rows if r.get("health_status")=="WEAKENING"]
+        invalid= [r for r in rows if r.get("health_status")=="INVALID"]
+        healthy= [r for r in rows if r.get("health_status")=="HEALTHY"]
+    return {
+        "new_patterns_week":    len(new_p),
+        "weakening_patterns":   len(weak),
+        "invalid_patterns":     len(invalid),
+        "healthy_patterns":     len(healthy),
+        "weakening_list":  [dict(r) for r in weak],
+        "invalid_list":    [dict(r) for r in invalid],
+    }
+
+
+# =====================================================================
+# World Model V1.1 — 模块4: Prediction Graveyard
+# =====================================================================
+@router.post("/predictions/{pid}/bury")
+def bury_prediction(pid: int, failure_reason: str = "model_error",
+                    lesson_learned: str | None = None):
+    """将失败预测移入墓地，供世界模型学习。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM prediction_log WHERE id=%s", (pid,))
+        pred = cur.fetchone()
+        if not pred: raise HTTPException(404, "预测不存在")
+        err = float(pred["error_rate"] or 0)
+        severity = "HIGH" if err > 0.5 else ("MEDIUM" if err > 0.2 else "LOW")
+        cur.execute("""
+            INSERT INTO prediction_graveyard
+              (prediction_id, prediction_content, expected_result, actual_result,
+               error_rate, failure_reason, severity, lesson_learned)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (pid, pred["statement"], pred["predicted_value"], pred["actual_value"],
+              err, failure_reason, severity, lesson_learned))
+        conn.commit()
+    return {"buried": True, "severity": severity,
+            "note": "已记入预测墓地，用于修正世界模型。"}
+
+
+@router.get("/predictions/graveyard")
+def list_graveyard(limit: int = 20):
+    """预测墓地列表：失败预测供模型学习。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT g.*, p.statement AS original_statement
+            FROM prediction_graveyard g
+            LEFT JOIN prediction_log p ON p.id=g.prediction_id
+            ORDER BY g.error_rate DESC NULLS LAST, g.created_at DESC
+            LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+        # Top 10 高误差
+        cur.execute("""
+            SELECT g.prediction_content, g.error_rate, g.failure_reason, g.severity
+            FROM prediction_graveyard g
+            ORDER BY g.error_rate DESC NULLS LAST LIMIT 10
+        """)
+        top_errors = cur.fetchall()
+    return {
+        "graveyard": [dict(r) for r in rows],
+        "top_10_errors": [dict(r) for r in top_errors],
+        "note": "世界模型优先从失败案例学习。高误差预测是模型最重要的修正信号。"
+    }
+
+
+# =====================================================================
+# World Model V1.1 — 统一健康仪表盘
+# =====================================================================
+@router.get("/dashboard/world-model-health")
+def world_model_health():
+    """世界模型综合健康仪表盘：数据质量 + 规律成熟度 + 预测墓地 + Pattern Health。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # 数据质量
+        cur.execute("SELECT * FROM data_quality_metrics ORDER BY measured_date DESC LIMIT 1")
+        dq = cur.fetchone()
+        dq_score = float((dq["overall_score"] or 0)) if dq else 0
+
+        # 规律成熟度分布
+        cur.execute("""
+            SELECT pattern_maturity, COUNT(*) n
+            FROM pattern_library GROUP BY pattern_maturity
+        """)
+        maturity_dist = {r["pattern_maturity"]: r["n"] for r in cur.fetchall()}
+
+        # Pattern Health
+        cur.execute("""
+            SELECT health_status, COUNT(*) n FROM (
+                SELECT DISTINCT ON (pattern_id) pattern_id, health_status
+                FROM pattern_health ORDER BY pattern_id, measured_at DESC
+            ) sub GROUP BY health_status
+        """)
+        health_dist = {r["health_status"]: r["n"] for r in cur.fetchall()}
+
+        # 预测墓地
+        cur.execute("SELECT COUNT(*) n, AVG(error_rate) avg_err FROM prediction_graveyard")
+        grave = cur.fetchone()
+
+        # 规律提取是否被暂停
+        allow_extract = dq_score >= 80
+
+    return {
+        "data_quality_score":   dq_score,
+        "data_quality_level":   (dq["quality_level"] if dq else "UNKNOWN"),
+        "allow_pattern_extraction": allow_extract,
+        "pattern_maturity": {
+            "HIGH_CONFIDENCE": maturity_dist.get("HIGH_CONFIDENCE", 0),
+            "VALIDATED":       maturity_dist.get("VALIDATED", 0),
+            "PRELIMINARY":     maturity_dist.get("PRELIMINARY", 0),
+            "OBSERVING":       maturity_dist.get("OBSERVING", 0),
+        },
+        "pattern_health": {
+            "healthy":   health_dist.get("HEALTHY", 0),
+            "weakening": health_dist.get("WEAKENING", 0),
+            "invalid":   health_dist.get("INVALID", 0),
+        },
+        "prediction_graveyard_count": grave["n"] or 0,
+        "avg_error_rate": round(float(grave["avg_err"] or 0), 4),
+        "warning": (None if allow_extract
+                    else "⚠️ 数据质量低于80分，Knowledge Layer规律提取已暂停。"),
+        "status_summary": (
+            "🟢 健康" if dq_score >= 80 and health_dist.get("WEAKENING",0) == 0
+            else "🟡 注意" if dq_score >= 60
+            else "🔴 危险"
+        )
     }
