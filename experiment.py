@@ -985,3 +985,551 @@ def dashboard():
         "dead_patterns_week":  pw["dead_patterns"] or 0,
         "counter_examples_week": cw["new_counters"] or 0,
     }
+"""
+experiment_patch.py
+追加到 experiment.py 末尾。包含：
+  L0 占位接口（3个，返回占位响应）
+  L1 content_intelligence 录入/查询/实验/Dashboard
+  L2 Business Dashboard / 漏斗转化率 / 排行榜补充
+  L3 predictions生成/验证 / 周报 / 跨层规律提取 / Knowledge Dashboard
+  L4 占位接口（3个，返回占位响应）
+"""
+
+# ─────────────────────────────────────────────────────────────────────
+# L0: Environment Model 占位接口
+# ─────────────────────────────────────────────────────────────────────
+class EnvironmentSignalIn(BaseModel):
+    signal_type: str = "market_trend"
+    country: str | None = None
+    signal_date: str | None = None   # YYYY-MM-DD
+    description: str = ""
+    impact_level: str = "medium"
+    source: str = "manual"
+
+
+@router.post("/environment")
+def create_environment_signal(body: EnvironmentSignalIn):
+    """L0 占位：录入环境信号。暂不实现分析逻辑。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO environment_signal
+              (signal_type, country, signal_date, description, impact_level, source)
+            VALUES (%s,%s,%s,%s,%s,%s) RETURNING id
+        """, (body.signal_type, body.country, body.signal_date or None,
+              body.description, body.impact_level, body.source))
+        sid = cur.fetchone()[0]
+        conn.commit()
+    return {"signal_id": sid, "status": "recorded",
+            "note": "L0 环境感知层已记录，分析逻辑待后续实现。"}
+
+
+@router.get("/environment")
+def list_environment_signals(days: int = 30):
+    """L0 占位：查询环境信号。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT * FROM environment_signal
+            WHERE created_at >= now() - interval '%s days'
+            ORDER BY created_at DESC LIMIT 50
+        """ % days)
+        return {"signals": cur.fetchall(), "note": "L0 分析逻辑待后续实现。"}
+
+
+@router.get("/dashboard/environment")
+def dashboard_environment():
+    """L0 占位：环境感知 Dashboard。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM environment_signal WHERE created_at >= now()-interval '30 days'")
+        cnt = cur.fetchone()[0] or 0
+    return {
+        "total_signals_30d": cnt,
+        "market_trend_count": 0,
+        "competitor_count": 0,
+        "policy_count": 0,
+        "note": "L0 环境感知层占位。分析逻辑待后续实现。",
+        "status": "placeholder"
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# L1: Content World Model
+# ─────────────────────────────────────────────────────────────────────
+class ContentIntelligenceIn(BaseModel):
+    content_id: int | None = None
+    platform: str = "facebook"
+    content_type: str | None = None   # 观点/案例/参数/价格/对比/故事/新闻/客户案例
+    video_style: str | None = None    # 数字人口播/真人口播/实拍/混剪/幻灯片
+    duration_sec: int | None = None
+    hook_type: str | None = None      # 问题/震惊/价格/故事/数据
+    country: str | None = None
+    car_model: str | None = None
+    # 平台指标（可手动填，也可由 FB Insights 自动同步）
+    impressions: int = 0
+    reach: int = 0
+    retention_3s: float = 0
+    retention_5s: float = 0
+    avg_watch_time: float = 0
+    completion_rate: float = 0
+    like_rate: float = 0
+    comment_rate: float = 0
+    share_rate: float = 0
+    save_rate: float = 0
+    follow_rate: float = 0
+
+
+@router.post("/content-intelligence")
+def create_content_intelligence(body: ContentIntelligenceIn):
+    """L1: 录入内容智能数据（内容形式 + 平台指标）。"""
+    # 如果关联了 content_id，自动补充 content_type/country/car_model
+    ct = body.content_type; country = body.country; model = body.car_model
+    if body.content_id and not (ct and country and model):
+        try:
+            with get_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT content_type, country, car_model FROM content_log WHERE id=%s",
+                            (body.content_id,))
+                row = cur.fetchone()
+                if row:
+                    ct = ct or row[0]
+                    country = country or row[1]
+                    model = model or row[2]
+        except: pass
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO content_intelligence
+              (content_id, platform, content_type, video_style, duration_sec,
+               hook_type, country, car_model, impressions, reach,
+               retention_3s, retention_5s, avg_watch_time, completion_rate,
+               like_rate, comment_rate, share_rate, save_rate, follow_rate)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+        """, (body.content_id, body.platform, ct, body.video_style,
+              body.duration_sec, body.hook_type, country, model,
+              body.impressions, body.reach, body.retention_3s, body.retention_5s,
+              body.avg_watch_time, body.completion_rate, body.like_rate,
+              body.comment_rate, body.share_rate, body.save_rate, body.follow_rate))
+        cid = cur.fetchone()[0]
+        conn.commit()
+    return {"content_intelligence_id": cid, "content_type": ct}
+
+
+@router.get("/content-intelligence")
+def list_content_intelligence(content_type: str | None = None,
+                               video_style: str | None = None,
+                               days: int = 30):
+    """L1: 查询内容智能列表。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        sql = """
+            SELECT ci.*, c.fb_post_id, c.posted_at
+            FROM content_intelligence ci
+            LEFT JOIN content_log c ON c.id = ci.content_id
+            WHERE ci.synced_at >= now() - interval '%s days'
+        """ % days
+        params = []
+        if content_type:
+            sql += " AND ci.content_type=%s"; params.append(content_type)
+        if video_style:
+            sql += " AND ci.video_style=%s"; params.append(video_style)
+        sql += " ORDER BY ci.synced_at DESC LIMIT 200"
+        cur.execute(sql, params)
+        return {"items": cur.fetchall()}
+
+
+@router.post("/content-experiment/run")
+def run_content_experiment(test_type: str, control_type: str,
+                            metric: str = "completion_rate", days: int = 30):
+    """L1: 内容实验——对比两种内容类型的平台指标。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        def stats(ct):
+            cur.execute(f"""
+                SELECT COUNT(*) n,
+                       COALESCE(AVG(completion_rate),0) cr,
+                       COALESCE(AVG(retention_3s),0) r3,
+                       COALESCE(AVG(like_rate),0) lr,
+                       COALESCE(AVG(comment_rate),0) cmr,
+                       COALESCE(AVG(share_rate),0) sr,
+                       COALESCE(AVG(impressions),0) imp
+                FROM content_intelligence
+                WHERE content_type=%s AND synced_at>=now()-interval '{days} days'
+            """, (ct,))
+            r = cur.fetchone()
+            return {"content_type":ct,"n":r[0],"completion_rate":round(float(r[1]),4),
+                    "retention_3s":round(float(r[2]),4),"like_rate":round(float(r[3]),4),
+                    "comment_rate":round(float(r[4]),4),"share_rate":round(float(r[5]),4),
+                    "avg_impressions":round(float(r[6]),1)}
+        test = stats(test_type); ctrl = stats(control_type)
+        metric_val = test.get(metric,0); ctrl_val = ctrl.get(metric,0)
+        lift = round(metric_val - ctrl_val, 4)
+        conclusion = "数据不足" if min(test["n"],ctrl["n"])<3 \
+            else ("成立" if lift>0 else "推翻")
+    return {"test": test, "control": ctrl, "metric": metric,
+            "lift": lift, "conclusion": conclusion,
+            "note": "L1 内容实验：目标为平台指标（非利润）。与L2交叉验证方可得出最终结论。"}
+
+
+@router.get("/dashboard/content")
+def dashboard_content(days: int = 30):
+    """L1: Content Dashboard。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT COUNT(*) total,
+                   COALESCE(AVG(completion_rate),0) avg_cr,
+                   COALESCE(AVG(retention_3s),0) avg_r3,
+                   COALESCE(AVG(like_rate+comment_rate+share_rate),0) avg_engagement,
+                   COALESCE(AVG(impressions),0) avg_imp
+            FROM content_intelligence
+            WHERE synced_at >= now()-interval '{days} days'
+        """)
+        s = cur.fetchone()
+        # 按内容类型排行
+        cur.execute(f"""
+            SELECT content_type,
+                   COUNT(*) n,
+                   COALESCE(AVG(completion_rate),0) avg_cr,
+                   COALESCE(AVG(retention_3s),0) avg_r3,
+                   COALESCE(AVG(like_rate+comment_rate+share_rate),0) avg_eng
+            FROM content_intelligence
+            WHERE synced_at >= now()-interval '{days} days'
+              AND content_type IS NOT NULL
+            GROUP BY content_type ORDER BY avg_cr DESC
+        """)
+        by_type = cur.fetchall()
+        # 按 hook 类型排行
+        cur.execute(f"""
+            SELECT hook_type,
+                   COUNT(*) n,
+                   COALESCE(AVG(retention_3s),0) avg_r3,
+                   COALESCE(AVG(completion_rate),0) avg_cr
+            FROM content_intelligence
+            WHERE synced_at >= now()-interval '{days} days'
+              AND hook_type IS NOT NULL
+            GROUP BY hook_type ORDER BY avg_r3 DESC
+        """)
+        by_hook = cur.fetchall()
+    return {
+        "total_content": s["total"] or 0,
+        "avg_completion_rate": round(float(s["avg_cr"] or 0), 4),
+        "avg_retention_3s": round(float(s["avg_r3"] or 0), 4),
+        "avg_engagement_rate": round(float(s["avg_engagement"] or 0), 4),
+        "avg_impressions": round(float(s["avg_imp"] or 0), 1),
+        "by_content_type": [dict(r) for r in by_type],
+        "by_hook_type": [dict(r) for r in by_hook],
+    }
+
+
+@router.get("/leaderboard/content")
+def leaderboard_content(days: int = 30):
+    """L1+L2 内容排行：完播率 / 互动率 / 询盘率 / 利润。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT ci.content_type,
+                   COUNT(DISTINCT ci.id) n,
+                   COALESCE(AVG(ci.completion_rate),0) avg_cr,
+                   COALESCE(AVG(ci.like_rate+ci.comment_rate+ci.share_rate),0) avg_eng,
+                   COUNT(DISTINCT l.id) leads,
+                   COALESCE(SUM(p.profit),0) profit
+            FROM content_intelligence ci
+            LEFT JOIN content_log c     ON c.id=ci.content_id
+            LEFT JOIN lead_log l        ON l.content_id=c.id
+            LEFT JOIN profit_log p      ON p.content_id=c.id
+            WHERE ci.synced_at >= now()-interval '{days} days'
+              AND ci.content_type IS NOT NULL
+            GROUP BY ci.content_type
+            ORDER BY profit DESC, avg_cr DESC
+        """)
+        return {"leaderboard": [dict(r) for r in cur.fetchall()],
+                "note": "按利润降序排列，利润相同则按完播率。"}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# L2: Business Dashboard 补充
+# ─────────────────────────────────────────────────────────────────────
+@router.get("/dashboard/business")
+def dashboard_business(days: int = 30):
+    """L2: Business Dashboard——询盘/报价/成交/利润/ROI。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT COUNT(DISTINCT l.id) leads,
+                   COUNT(DISTINCT l.id) FILTER (WHERE l.lead_quality='high') hq,
+                   COUNT(DISTINCT q.id) quotes,
+                   COUNT(DISTINCT d.id) deals,
+                   COALESCE(SUM(p.profit),0) profit,
+                   COALESCE(SUM(p.revenue),0) revenue,
+                   COALESCE(SUM(c.ad_spend),0) ad_spend
+            FROM lead_log l
+            LEFT JOIN quotation_log q ON q.lead_id=l.id
+            LEFT JOIN deal_log d      ON d.lead_id=l.id
+            LEFT JOIN profit_log p    ON p.lead_id=l.id
+            LEFT JOIN content_log c   ON c.id=l.content_id
+            WHERE l.created_at >= now()-interval '{days} days'
+        """)
+        s = cur.fetchone()
+        leads=s["leads"] or 0; hq=s["hq"] or 0
+        quotes=s["quotes"] or 0; deals=s["deals"] or 0
+        profit=float(s["profit"] or 0); revenue=float(s["revenue"] or 0)
+        ad_spend=float(s["ad_spend"] or 0)
+    return {
+        "total_leads": leads, "hq_leads": hq,
+        "quotations": quotes, "deals": deals,
+        "total_profit": profit, "total_revenue": revenue,
+        "roi": round(profit/ad_spend, 2) if ad_spend else None,
+        "qualified_rate": round(hq/leads, 4) if leads else 0,
+        "quote_rate":     round(quotes/leads, 4) if leads else 0,
+        "deal_rate":      round(deals/leads, 4) if leads else 0,
+        "profit_per_lead": round(profit/leads, 2) if leads else 0,
+    }
+
+
+@router.get("/funnel/conversion")
+def funnel_conversion(days: int = 30):
+    """L2: 完整漏斗转化率——Content→Lead→Quote→Deal→Profit。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM content_log WHERE posted_at>=now()-interval '{days} days'")
+        contents = cur.fetchone()[0] or 0
+        cur.execute(f"SELECT COUNT(*) FROM lead_log WHERE created_at>=now()-interval '{days} days'")
+        leads = cur.fetchone()[0] or 0
+        cur.execute(f"SELECT COUNT(*) FROM quotation_log WHERE quotation_time>=now()-interval '{days} days'")
+        quotes = cur.fetchone()[0] or 0
+        cur.execute(f"SELECT COUNT(*) FROM deal_log WHERE close_time>=now()-interval '{days} days'")
+        deals = cur.fetchone()[0] or 0
+        cur.execute(f"SELECT COALESCE(SUM(profit),0) FROM profit_log WHERE created_at>=now()-interval '{days} days'")
+        profit = float(cur.fetchone()[0] or 0)
+    return {
+        "contents": contents, "leads": leads,
+        "quotes": quotes, "deals": deals, "total_profit": profit,
+        "content_to_lead": round(leads/contents, 4) if contents else 0,
+        "lead_to_quote":   round(quotes/leads, 4)   if leads else 0,
+        "quote_to_deal":   round(deals/quotes, 4)   if quotes else 0,
+        "deal_to_profit":  profit/deals              if deals else 0,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# L3: Knowledge — Predictions / Weekly Report / 跨层规律
+# ─────────────────────────────────────────────────────────────────────
+class PredictionIn(BaseModel):
+    pattern_id: int
+    statement: str
+    predicted_value: float
+    confidence: float
+    verify_days: int = 7
+
+
+@router.post("/predictions")
+def create_prediction(body: PredictionIn):
+    """L3: 基于规律生成预测。"""
+    verify_at = datetime.utcnow() + timedelta(days=body.verify_days)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO prediction_log
+              (pattern_id, statement, predicted_value, confidence, verify_at)
+            VALUES (%s,%s,%s,%s,%s) RETURNING id
+        """, (body.pattern_id, body.statement, body.predicted_value,
+              body.confidence, verify_at))
+        pid = cur.fetchone()[0]
+        cur.execute("UPDATE pattern_library SET prediction_count=prediction_count+1 WHERE id=%s",
+                    (body.pattern_id,))
+        conn.commit()
+    return {"prediction_id": pid, "verify_at": verify_at.isoformat()}
+
+
+class VerifyPredictionIn(BaseModel):
+    actual_value: float
+    outcome: str   # reinforce / weaken / overturn
+
+
+@router.post("/predictions/{pid}/verify")
+def verify_prediction(pid: int, body: VerifyPredictionIn):
+    """L3: 验证预测，回写结果，更新规律计数。"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT pattern_id, predicted_value FROM prediction_log WHERE id=%s", (pid,))
+        row = cur.fetchone()
+        if not row: raise HTTPException(404, "预测不存在")
+        pattern_id, pred_val = row
+        err = round(abs(body.actual_value - pred_val) / pred_val, 4) if pred_val else None
+        status = "success" if body.outcome == "reinforce" else "fail"
+        cur.execute("""
+            UPDATE prediction_log
+            SET actual_value=%s, error_rate=%s, outcome=%s,
+                status=%s, verified_time=now()
+            WHERE id=%s
+        """, (body.actual_value, err, body.outcome, status, pid))
+        # 更新规律预测成功/失败计数
+        if body.outcome == "reinforce":
+            cur.execute("UPDATE pattern_library SET prediction_success=prediction_success+1 WHERE id=%s", (pattern_id,))
+        else:
+            cur.execute("UPDATE pattern_library SET prediction_failure=prediction_failure+1 WHERE id=%s", (pattern_id,))
+        conn.commit()
+    return {"verified": True, "status": status, "error_rate": err, "outcome": body.outcome}
+
+
+@router.post("/patterns/extract-l1")
+def extract_l1_patterns():
+    """L3: 从 content_intelligence 提取 L1 内容规律。"""
+    saved = 0
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT content_type, COUNT(*) n,
+                   AVG(completion_rate) cr, AVG(retention_3s) r3,
+                   AVG(like_rate+comment_rate+share_rate) eng
+            FROM content_intelligence
+            WHERE content_type IS NOT NULL
+              AND synced_at >= now()-interval '90 days'
+            GROUP BY content_type HAVING COUNT(*)>=3
+        """)
+        for r in cur.fetchall():
+            pname = f"{r['content_type']}内容完播规律"
+            conf = round(min(r["n"]/10.0, 1.0) * 0.7, 3)
+            cur.execute("""
+                INSERT INTO pattern_library
+                  (pattern_name, description, dimension, dimension_value,
+                   metric, effect_size, support_count, confidence, profit_contribution)
+                VALUES (%s,%s,'content_type',%s,'completion_rate',%s,%s,%s,0)
+                ON CONFLICT DO NOTHING
+            """, (pname,
+                  f"{r['content_type']}完播率均值{float(r['cr'] or 0):.1%}，3秒留存{float(r['r3'] or 0):.1%}",
+                  r["content_type"], round(float(r["cr"] or 0),4), r["n"], conf))
+            saved += 1
+        conn.commit()
+    return {"patterns_extracted": saved, "layer": "L1"}
+
+
+@router.post("/patterns/extract-cross")
+def extract_cross_patterns():
+    """L3: 提取跨层规律（L1内容指标 AND L2利润双维度）。"""
+    saved = 0
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT ci.content_type,
+                   COUNT(DISTINCT ci.id) n,
+                   AVG(ci.completion_rate) avg_cr,
+                   COALESCE(SUM(p.profit),0) total_profit,
+                   COUNT(DISTINCT l.id) leads
+            FROM content_intelligence ci
+            LEFT JOIN content_log c ON c.id=ci.content_id
+            LEFT JOIN lead_log l    ON l.content_id=c.id
+            LEFT JOIN profit_log p  ON p.content_id=c.id
+            WHERE ci.content_type IS NOT NULL
+              AND ci.synced_at >= now()-interval '90 days'
+            GROUP BY ci.content_type HAVING COUNT(DISTINCT ci.id)>=3
+        """)
+        for r in cur.fetchall():
+            pname = f"{r['content_type']}内容跨层规律（完播率+利润）"
+            profit_per = float(r["total_profit"] or 0) / max(r["n"],1)
+            conf = round(min(r["n"]/8.0, 1.0) * (0.4 + 0.6*min(r["leads"]/5.0,1.0)), 3)
+            cur.execute("""
+                INSERT INTO pattern_library
+                  (pattern_name, description, dimension, dimension_value,
+                   metric, effect_size, support_count, confidence, profit_contribution)
+                VALUES (%s,%s,'content_type',%s,'profit_per_content',%s,%s,%s,%s)
+                ON CONFLICT DO NOTHING
+            """, (pname,
+                  f"完播率{float(r['avg_cr'] or 0):.1%}，每条内容利润${profit_per:.0f}，样本{r['n']}条",
+                  r["content_type"], round(profit_per,2), r["n"], conf, float(r["total_profit"] or 0)))
+            saved += 1
+        conn.commit()
+    return {"patterns_extracted": saved, "layer": "L1+L2 cross"}
+
+
+@router.get("/weekly-report")
+def weekly_report():
+    """L3: 每周知识报告——新增规律/失效规律/反例/预测成功率/四排行榜。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT COUNT(*) n FROM pattern_library WHERE created_at>=now()-interval '7 days'")
+        new_patterns = cur.fetchone()["n"] or 0
+        cur.execute("SELECT COUNT(*) n FROM pattern_library WHERE status='overturned' AND last_update>=now()-interval '7 days'")
+        dead_patterns = cur.fetchone()["n"] or 0
+        cur.execute("SELECT COUNT(*) n FROM counter_example WHERE created_at>=now()-interval '7 days'")
+        new_counters = cur.fetchone()["n"] or 0
+        cur.execute("""
+            SELECT COUNT(*) total,
+                   COUNT(*) FILTER (WHERE status='success') success
+            FROM prediction_log WHERE verified_time>=now()-interval '7 days'
+        """)
+        pr = cur.fetchone()
+        pred_total = pr["total"] or 0
+        pred_success = pr["success"] or 0
+        pred_accuracy = round(pred_success/pred_total, 3) if pred_total else None
+
+        # 内容规律排行
+        cur.execute("SELECT pattern_name, confidence, profit_contribution FROM pattern_library WHERE dimension='content_type' AND status='active' ORDER BY profit_contribution DESC LIMIT 5")
+        top_content = cur.fetchall()
+        # 国家利润排行
+        cur.execute("SELECT country, COUNT(*) deals, COALESCE(SUM(profit),0) profit FROM profit_log WHERE created_at>=now()-interval '7 days' GROUP BY country ORDER BY profit DESC LIMIT 5")
+        top_country = cur.fetchall()
+        # 车型利润排行
+        cur.execute("SELECT car_model, COUNT(*) deals, COALESCE(SUM(profit),0) profit FROM profit_log WHERE created_at>=now()-interval '7 days' GROUP BY car_model ORDER BY profit DESC LIMIT 5")
+        top_model = cur.fetchall()
+
+    return {
+        "period": "last_7_days",
+        "new_patterns": new_patterns,
+        "dead_patterns": dead_patterns,
+        "new_counter_examples": new_counters,
+        "prediction_accuracy": pred_accuracy,
+        "prediction_total": pred_total,
+        "top_content_patterns": [dict(r) for r in top_content],
+        "top_country_profit":   [dict(r) for r in top_country],
+        "top_model_profit":     [dict(r) for r in top_model],
+    }
+
+
+@router.get("/dashboard/knowledge")
+def dashboard_knowledge():
+    """L3: Knowledge Dashboard——规律/置信度/预测准确率/反例/WM Score。"""
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT COUNT(*) total,
+                   COUNT(*) FILTER (WHERE status='active') active,
+                   COUNT(*) FILTER (WHERE status='overturned') overturned,
+                   COALESCE(AVG(confidence),0) avg_conf,
+                   COALESCE(SUM(prediction_count),0) pred_total,
+                   COALESCE(SUM(prediction_success),0) pred_success
+            FROM pattern_library
+        """)
+        p = cur.fetchone()
+        cur.execute("SELECT COUNT(*) n FROM counter_example WHERE created_at>=now()-interval '30 days'")
+        counters = cur.fetchone()["n"] or 0
+        pred_acc = round(float(p["pred_success"] or 0)/float(p["pred_total"] or 1), 3) if (p["pred_total"] or 0)>0 else 0
+        # WM Score
+        active_r = float(p["active"] or 0)/max(float(p["total"] or 1),1)
+        wm_score = round((0.35*pred_acc + 0.25*active_r + 0.20*min(counters/5.0,1.0) + 0.20*float(p["avg_conf"] or 0))*100, 1)
+    return {
+        "total_patterns": p["total"] or 0,
+        "active_patterns": p["active"] or 0,
+        "overturned_patterns": p["overturned"] or 0,
+        "avg_confidence": round(float(p["avg_conf"] or 0), 3),
+        "prediction_accuracy": pred_acc,
+        "counter_examples_30d": counters,
+        "world_model_score": wm_score,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# L4: Decision Engine 占位接口
+# ─────────────────────────────────────────────────────────────────────
+@router.get("/decisions")
+def list_decisions():
+    """L4 占位：查询决策建议列表。分析逻辑待后续实现。"""
+    return {"decisions": [], "status": "placeholder",
+            "note": "L4 Decision Engine 待 L1/L2/L3 数据积累后实现。"}
+
+
+@router.post("/decisions/generate")
+def generate_decisions():
+    """L4 占位：触发决策生成。暂不实现任何决策逻辑。"""
+    return {"status": "not_implemented",
+            "note": "L4 Decision Engine 待 L1/L2/L3 数据积累后实现。当前请手动分析 /weekly-report 和 /leaderboard 数据做决策。"}
+
+
+@router.get("/dashboard/decision")
+def dashboard_decision():
+    """L4 占位：Decision Dashboard。"""
+    return {
+        "pending_decisions": 0,
+        "executed_decisions": 0,
+        "decision_hit_rate": None,
+        "next_week_recommendation": None,
+        "status": "placeholder",
+        "note": "L4 Decision Engine 占位。待 L3 规律库达到 20+ 条高置信规律后开始实现。"
+    }
