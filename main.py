@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv, set_key
@@ -1039,6 +1039,45 @@ def apply_ai_schedule(data: AiScheduleApplyRequest):
     }
 
 # ── 车型管理 ──────────────────────────────────────────────────
+@app.post("/video/upload-and-publish")
+async def upload_and_publish_video(
+    file: UploadFile = File(...),
+    caption: str = Form(default=""),
+    model: str = Form(default="T5 EVO"),
+):
+    """直接上传本地 MP4 文件并发布到 Facebook。
+    WSL/本地视频工厂生成的成品视频可通过此接口发布。"""
+    try:
+        video_bytes = await file.read()
+        if len(video_bytes) == 0:
+            return {"success": False, "error": "文件为空"}
+        from video_post import publish_video_fb
+        fb_resp = publish_video_fb(video_bytes, caption)
+        fb_post_id = fb_resp.get("id")
+        # 写入 content_log
+        if fb_post_id:
+            try:
+                from experiment import get_conn
+                with get_conn() as conn, conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO content_log
+                          (platform, content_type, car_model, fb_post_id, ad_spend)
+                        VALUES ('facebook','视频','%s','%s',0)
+                    """ % (model, fb_post_id))
+                    conn.commit()
+            except Exception as e:
+                print(f"[upload-publish] content_log写入失败: {e}")
+            log_post(model, "French", "Africa", "product_intro", caption, fb_resp)
+        return {
+            "success": bool(fb_post_id),
+            "fb_post_id": fb_post_id,
+            "file_size_mb": round(len(video_bytes)/1024/1024, 2),
+            "response": fb_resp,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/vehicles")
 def get_vehicles():
     """返回所有车型详细信息"""
